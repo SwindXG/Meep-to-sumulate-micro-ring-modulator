@@ -19,9 +19,10 @@
 7. [指標定義](#指標定義)
 8. [模擬結果](#模擬結果)
 9. [限制與注意事項](#限制與注意事項)
-10. [接上逆向設計](#接上逆向設計)
-11. [預估執行時間](#預估執行時間)
-12. [參考文獻](#參考文獻)
+10. [資料有效性檢查](#資料有效性檢查)
+11. [接上逆向設計](#接上逆向設計)
+12. [預估執行時間](#預估執行時間)
+13. [參考文獻](#參考文獻)
 
 ---
 
@@ -84,6 +85,8 @@ mpirun -np 4 python micro_ring_modulator_meep.py
 
 執行結束後，終端機會印出各項指標，並在目前資料夾產生圖檔與光譜資料。
 
+放大圖的範圍由程式開頭的 `PLOT_ZOOM` 控制（兩個凹谷外各多留幾倍 FWHM，預設 4，數字越小畫面越放大）。
+
 **第一次使用建議先用低成本設定確認流程**：在 `PARAMS` 中把 `RESOLUTION` 設為 20、`NFREQ` 設為 200，掃描範圍縮小到單一共振附近（例如 1.540 到 1.550 µm）。確認結果合理後再提高解析度與降低 `DECAY`。
 
 ## 參數說明
@@ -94,16 +97,16 @@ mpirun -np 4 python micro_ring_modulator_meep.py
 |---|---|---|
 | `R` | 3.0 | 環中心線半徑 |
 | `W` | 0.5 | 波導寬度（環與直波導相同） |
-| `GAP` | 0.15 | 直波導與環邊緣的間隙，決定耦合強度 |
+| `GAP` | 0.20 | 直波導與環邊緣的間隙，決定耦合強度 |
 | `N_SI` | 2.8 | 矽的等效折射率（2D 近似） |
 | `N_CLAD` | 1.44 | 包覆層 SiO₂ 的折射率 |
-| `WVL_MIN`, `WVL_MAX` | 1.50, 1.60 | 掃描波長範圍 |
-| `NFREQ` | 800 | 頻率取樣點數，決定光譜的細緻度 |
+| `WVL_MIN`, `WVL_MAX` | 1.535, 1.555 | 掃描波長範圍（要小於 FSR，且涵蓋 OFF 與 ON 的凹谷） |
+| `NFREQ` | 1200 | 頻率取樣點數，決定光譜的細緻度 |
 | `RESOLUTION` | 40 | 每 µm 的像素數 |
 | `DPML` | 1.0 | PML 厚度 |
 | `DN_ON` | −0.004 | 電壓 ON 的折射率變化（示意值） |
-| `DALPHA_ON` | 15.0 | 電壓 ON 的額外吸收，單位 cm⁻¹（示意值） |
-| `DECAY` | 1e-5 | 場衰減到多小才停止，越小越準但越慢 |
+| `DALPHA_ON` | 0.0 | 電壓 ON 的額外吸收，單位 cm⁻¹（先設 0，只看折射率造成的位移） |
+| `DECAY` | 1e-6 | 場衰減到多小才停止，越小越準但越慢 |
 
 主要函式：
 
@@ -112,14 +115,19 @@ mpirun -np 4 python micro_ring_modulator_meep.py
 | `run_spectrum` | 跑一次模擬，回傳各頻率的穿透功率 |
 | `analyze_dip` | 從光譜找凹谷，回傳 λ₀、FWHM、Q、ER |
 | `modulator_metrics` | 比較 OFF/ON，回傳 OMA、調變 ER、IL |
-| `evaluate` | 從參數到指標的完整流程（逆向設計用） |
+| `check_dip` | 檢查一條光譜的凹谷是否可信（見「資料有效性檢查」） |
+| `adjust_for_retry` | 檢查不合格時，嘗試自動修正（平移窗口、加嚴 DECAY） |
+| `predict_center` | 由已知結果預測新 R 的共振位置，用來放置掃描窗口 |
+| `evaluate` | 從參數到指標的完整流程，含檢查與自動重試（逆向設計用） |
+| `figure_of_merit` | 把指標變成單一分數，無效設計給固定懲罰分數 |
 
 ## 輸出檔案
 
 | 檔案 | 內容 |
 |---|---|
 | `mrm_structure.png` | 2D 結構平面圖（顏色深淺代表介電常數），並標出光源、監測器與 PML 內緣 |
-| `mrm_transmission.png` | 穿透率對波長，OFF 與 ON 兩條曲線，標出共振與雷射位置 |
+| `mrm_transmission.png` | 穿透率對波長（自動放大到兩個凹谷附近），標出共振波長、Δλ、雷射位置與 OMA，圖下方印出 Q、ER 等指標 |
+| `mrm_transmission_full.png` | 同一份資料的完整掃描範圍總覽 |
 | `mrm_spectra.npz` | 波長 `wvl_um`、`T_off`、`T_on` 陣列，可用於後續分析或機器學習訓練資料 |
 
 ## 指標定義
@@ -139,7 +147,7 @@ mpirun -np 4 python micro_ring_modulator_meep.py
 
 ## 模擬結果
 
-以下為一次試跑的結果，掃描 1540 到 1550 nm，使用預設的結構參數（`R=3.0`、`W=0.5`、`GAP=0.15`、`DN_ON=−0.004`、`DALPHA_ON=15`）。
+以下為一次試跑的結果，掃描 1540 到 1550 nm，使用的參數為 `R=3.0`、`W=0.5`、`GAP=0.15`、`DN_ON=−0.004`、`DALPHA_ON=15`（**與目前程式的預設值不同**，目前預設為 `GAP=0.20`、`DALPHA_ON=0`，詳見參數說明）。
 測試時使用的解析度與停止條件：`RESOLUTION=（請填寫）`、`DECAY=（請填寫）`、`NFREQ=（請填寫）`。
 
 ![穿透率對波長，1540 到 1550 nm](figures/transmission_1540_1550.png)
@@ -173,22 +181,49 @@ mpirun -np 4 python micro_ring_modulator_meep.py
 - **取樣與停止條件**：`DECAY` 太鬆會在環內場尚未衰減完時就停止，頻譜出現假的起伏甚至 T>1；`NFREQ` 太少會漏掉窄的凹谷。
 - 程式尚未與實驗數據或其他模擬軟體比對。
 
+## 資料有效性檢查
+
+逆向設計會用大量不同參數呼叫 `evaluate`。參數一改，共振位置就會移動（例如 `R` 變 1.7%，共振約移 26 nm），可能跑出掃描窗口、窗口內出現兩個共振，或模擬沒跑到收斂。這些情況下 `analyze_dip` 仍會算出數字，但數字是錯的。因此 `evaluate` 會對 OFF 與 ON 兩條光譜做檢查，並在回傳的字典中帶有 `valid` 與 `reason`：
+
+| 錯誤代碼 | 意義 | 自動處理 |
+|---|---|---|
+| `not_converged` | T 明顯大於 1，環內的光還沒漏完就停了 | 把 `DECAY` 縮小 100 倍後重跑 |
+| `no_dip` | 沒有明顯凹谷（共振可能完全在窗口外，或耦合太弱） | 無法自動修正 |
+| `edge_low` / `edge_high` | 凹谷在窗口邊緣，可能被切掉 | 朝凹谷那一側平移窗口後重跑 |
+| `incomplete` | 凹谷量不到半高寬 | 同上，平移窗口 |
+| `multi` | 窗口內有多個共振 | 無法自動修正，請縮小 `WVL_MIN`、`WVL_MAX` 或改 `R` |
+
+模擬本身失敗（當機、記憶體不足）也會被攔下，回傳 `valid=False`，不會讓批次中斷。
+
+**限制：** 窗口追蹤只在共振「剛好跑出邊緣、仍看得到凹谷的一側」時有效（以預設參數約為 `R` 變動 1% 內）。若共振完全離開窗口，光譜是平的，程式無法知道該往哪個方向移，會回報 `no_dip`。此時請用 `predict_center` 預測共振位置，並透過 `center_um` 引數放置窗口。以上檢查邏輯用合成光譜測試過，尚未在真實 Meep 模擬上驗證。
+
+**`valid=False` 時，其餘數值僅供除錯，不要拿去訓練。**
+
 ## 接上逆向設計
 
 `evaluate(p)` 接受一組參數字典，回傳指標字典，可直接當作最佳化或機器學習的**前向模擬器**：
 
 ```python
-from micro_ring_modulator_meep import PARAMS, evaluate
+from micro_ring_modulator_meep import (PARAMS, evaluate, figure_of_merit,
+                                       predict_center)
 
-p = dict(PARAMS, GAP=0.20, R=3.0)       # 修改要探索的參數
-metrics, ref = evaluate(p)              # 回傳 Q、ER_dB、OMA、IL_dB、shift_nm ...
-# 直波導沒變時，可重用參考光譜，每次省一次模擬：
-metrics2, _ = evaluate(dict(p, GAP=0.25), ref_flux=ref)
+cache = {}                                  # 參考光譜快取，多次呼叫共用，省掉重複的參考模擬
+p = dict(PARAMS, GAP=0.25)                  # 修改要探索的參數
+m = evaluate(p, ref_cache=cache)            # 回傳 Q、ER_dB、OMA、IL_dB、shift_nm、valid、reason ...
+
+if m["valid"]:                              # 只有可信的結果才拿來訓練
+    score = figure_of_merit(m)              # 單一分數，越大越好
+
+# 改了 R 之後，先預測共振位置再放窗口（lam_ref 是已知結果的 OFF 共振波長，單位 µm）
+center = predict_center(R_new=3.05, R_ref=3.0, lam_ref_um=1.5455)
+m2 = evaluate(dict(PARAMS, R=3.05), ref_cache=cache, center_um=center)
 ```
+
+`figure_of_merit` 對無效設計回傳固定的懲罰分數，而不是 nan，讓最佳化器避開那一區；原因仍保留在 `reason`。其中的加權只是示範，請依實際目標修改。`example_scan_R` 是一個掃描 `R` 並自動追蹤共振的完整範例。
 
 可探索的設計參數包括 `R`、`GAP`、`W`、`DN_ON`。典型做法有兩種：
 
-- **資料集加代理模型**：批次掃描參數，建立「參數 → 光譜或指標」資料集，訓練神經網路當代理模型，再用最佳化演算法反推設計。
+- **資料集加代理模型**：批次掃描參數，建立「參數 → 光譜或指標」資料集（只收 `valid=True` 的資料），訓練神經網路當代理模型，再用最佳化演算法反推設計。
 - **梯度法**：Meep 內建 adjoint solver，可對像素化的形狀求梯度（需另外把結構改寫成可微分的設計區域）。
 
 Meep 每次模擬耗時是主要瓶頸，建議先用低解析度的 2D 版本做大量掃描，最後再用高解析度驗證最佳解。
