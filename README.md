@@ -184,6 +184,8 @@ conda activate meep
 
 ## 4. 使用方式
 
+保留micro_ring_modulator_meep.py, mrm_sweep_analysis.xlsx, sweep_resolution.py, README.md其餘可刪除
+
 ```bash
 # 單核執行
 python micro_ring_modulator_meep.py
