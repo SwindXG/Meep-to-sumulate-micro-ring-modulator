@@ -219,6 +219,9 @@ python replot_from_npz.py --xlim 1537 1542      # 手動指定 x 軸範圍 (nm)
 | `RESOLUTION` | 40 | 數值 | 每 µm 的像素數 |
 | `NFREQ` | 1200 | 數值 | 頻率取樣點數，決定光譜的細緻度 |
 | `DECAY` | 1e-6 | 數值 | 場衰減到多小才停止，越小越準但越慢 |
+| `USE_HARMINV` | True | 在 OFF 的環模擬中加 Harminv，直接從時域衰減量 Q（尚未在真實 Meep 上驗證；出錯時改成 False） |
+| `ISOLATE_DIP` | False | True 時窗口可比 FSR 寬，分析只取最深的那個凹谷附近（掃 R 用） |
+| `FSR_EST_UM` | 0.0 | `ISOLATE_DIP=True` 時的 FSR 估計 (µm)；擷取範圍為凹谷兩側各 0.45 倍 FSR |
 | `DPML` | 1.0 | 數值 | PML 厚度 |
 | `WVL_MIN`, `WVL_MAX` | 1.535, 1.555 | 數值 | 掃描波長範圍（要小於 FSR，且涵蓋 OFF 與 ON 的凹谷） |
 
@@ -231,7 +234,10 @@ python replot_from_npz.py --xlim 1537 1542      # 手動指定 x 軸範圍 (nm)
 | `modulator_metrics` | 比較 OFF/ON，回傳 OMA、調變 ER、IL |
 | `check_dip` | 檢查一條光譜的凹谷是否可信（見第 8 節） |
 | `adjust_for_retry` | 檢查不合格時，嘗試自動修正（平移窗口、加嚴 DECAY） |
-| `predict_center` | 由已知結果預測新 R 的共振位置，用來放置掃描窗口 |
+| `fit_dip` | 對凹谷做洛倫茲擬合，回傳 λ₀、FWHM、Q、ER 與 Q 的不確定度 |
+| `pick_harminv_mode` | 從 Harminv 找到的模態中，挑出最接近凹谷位置的那一個，回傳它的 Q |
+| `isolate_main_dip` | 窗口內有多個共振時，只保留最深的那個凹谷附近的資料 |
+| `predict_center` | 由已知結果預測新 R 的共振位置；**只適用 R 小幅變動（約 1% 內）** |
 | `evaluate` | 從參數到指標的完整流程，含檢查與自動重試（逆向設計用） |
 | `figure_of_merit` | 把指標變成單一分數，無效設計給固定懲罰分數 |
 
@@ -243,6 +249,7 @@ python replot_from_npz.py --xlim 1537 1542      # 手動指定 x 軸範圍 (nm)
 | `mrm_transmission.png` | 穿透率對波長（自動放大到兩個凹谷附近）；上圖為 OFF/ON 光譜，標題顯示共振位移與 Q，圖例標出雷射位置與 OMA；下圖為 ΔT = T_on − T_off |
 | `mrm_transmission_full.png` | 同一份資料的完整掃描範圍總覽 |
 | `mrm_spectra.npz` | 波長 `wvl_um`、`T_off`、`T_on` 陣列，可用於後續分析、重畫圖或機器學習訓練資料 |
+| `sweep_spectra/*.npz` | 掃描時每一組的完整光譜（`sweep_resolution_gap.py` 自動存），之後可不重跑 Meep 而重新分析 |
 
 ## 7. 指標定義
 
@@ -259,6 +266,18 @@ python replot_from_npz.py --xlim 1537 1542      # 手動指定 x 軸範圍 (nm)
 
 目前程式把 `λ_L` 取在「OFF 與 ON 差最大」的波長。
 
+### 7.1 Q 的三種量法
+
+凹谷只有 2 到 3% 深、漣漪約 0.3% 時，半高寬法不夠穩（同一組設計重跑，Q 曾差 34%），所以程式同時提供三種量法，並在 CSV 與試算表中並列：
+
+| 欄位 | 方法 | 特點 |
+|---|---|---|
+| `Q` | 半高寬法：用最亮點、最暗點與半深度交叉點 | 簡單，但最亮點會被漣漪拉高而偏差，淺凹谷下誤差大 |
+| `Q_fit`、`Q_fit_err` | 洛倫茲擬合：用凹谷附近全部的點，並給出 Q 的相對不確定度 | 雜訊互相平均。用合成資料（凹谷深 2.7%、漣漪 0.3%）測試 300 次：半高寬法 Q 偏低約 9%、散布約 15%；擬合偏差約 +2%、散布約 8%。擬合自報的不確定度（約 4%）只含隨機雜訊，約為實際散布的一半 |
+| `Q_harminv` | Meep 的 Harminv：光源關掉後，由環內一個點的時域衰減量 Q | 不需要凹谷夠深，是最獨立的交叉驗證；**尚未在真實 Meep 上驗證** |
+
+試算表的「Q 採用值」優先用 `Q_fit`（沒有時退回半高寬法），收斂判定與 R 彙整都用採用值；「Q 一致性」欄顯示 `Q_harminv / Q_fit`，偏離 1 太多代表其中一種量法有問題。ER 同理有 `ER_dB`（半高寬法）與 `ER_fit_dB`（擬合）。
+
 ## 8. 資料有效性檢查
 
 逆向設計會用大量不同參數呼叫 `evaluate`。參數一改，共振位置就會移動（例如 `R` 變 1.7%，共振約移 26 nm），可能跑出掃描窗口、窗口內出現兩個共振，或模擬沒跑到收斂。這些情況下 `analyze_dip` 仍會算出數字，但數字是錯的。因此 `evaluate` 會對 OFF 與 ON 兩條光譜做檢查，並在回傳的字典中帶有 `valid` 與 `reason`：
@@ -269,33 +288,53 @@ python replot_from_npz.py --xlim 1537 1542      # 手動指定 x 軸範圍 (nm)
 | `no_dip` | 凹谷深度低於 0.1 dB（共振可能完全在窗口外，或耦合太弱而太淺） | 無法自動修正 |
 | `edge_low` / `edge_high` | 凹谷在窗口邊緣，可能被切掉 | 朝凹谷那一側平移窗口後重跑 |
 | `incomplete` | 凹谷量不到半高寬 | 同上，平移窗口 |
-| `multi` | 窗口內有多個共振 | 無法自動修正，請縮小 `WVL_MIN`、`WVL_MAX` 或改 `R` |
+| `multi` | 窗口內有多個共振。判斷方式：先做 5 點移動平均、以中位數為基線，再用遲滯（低於「基線 − 0.3 倍深度」算進入凹谷，回升到「基線 − 0.1 倍深度」以上才算離開）數凹谷個數，避免雜訊在門檻附近來回穿越而把一個凹谷誤數成多個 | 無法自動修正，請縮小 `WVL_MIN`、`WVL_MAX` 或改 `R` |
 
 模擬本身失敗（當機、記憶體不足）也會被攔下，回傳 `valid=False`，不會讓批次中斷。
 
-**限制：** 窗口追蹤只在共振「剛好跑出邊緣、仍看得到凹谷的一側」時有效（以預設參數約為 `R` 變動 1% 內）。若共振完全離開窗口，光譜是平的，程式無法知道該往哪個方向移，會回報 `no_dip`。此時請用 `predict_center` 預測共振位置，並透過 `center_um` 引數放置窗口。這套檢查邏輯先用合成光譜測試，再由第 10 節的真實掃描實際使用（沒有觸發重試）。
+**限制：** 窗口追蹤只在共振「剛好跑出邊緣、仍看得到凹谷的一側」時有效（以預設參數約為 `R` 變動 1% 內）。若共振完全離開窗口，光譜是平的，程式無法知道該往哪個方向移，會回報 `no_dip`。此時請用 `predict_center` 預測共振位置，並透過 `center_um` 引數放置窗口。
+
+**`predict_center` 也有限制：** 它假設「同一個階數 m」，即 λ 與 R 成正比，所以只適用 R 小幅變動。R 從 3 變成 5 µm 時，同一階的共振會從約 1540 nm 跑到約 2570 nm，完全不是我們要的波段。R 大幅變動時請改用 `ISOLATE_DIP`：窗口取約 1.1 個 FSR 寬（窗口內至少有一個完整的共振，不必知道它在哪），再讓 `evaluate` 只分析最深的那一個。`sweep_resolution_gap.py --Rs` 就是這樣做的（見第 9 節）。這套檢查邏輯先用合成光譜測試，再由第 10 節的真實掃描實際使用（沒有觸發重試）。
 
 **門檻的現況：** `no_dip` 的門檻 0.1 dB 是經驗值。第 10 節的掃描中，解析度 40 與 50 兩組的凹谷 ER（0.092、0.079 dB）略低於門檻而被標為 `valid=False`，但它們的位移與 Q 都與其他組一致，是真實但很淺的凹谷，不是模擬失敗。建議之後把門檻降到約 0.05 dB（約為雜訊的 4 倍）。
 
 **`valid=False` 時，其餘數值僅供除錯，不要拿去訓練。**
 
-## 9. 解析度與 gap 掃描
+## 9. 解析度、gap 與 R 掃描
 
-`sweep_resolution_gap.py` 批次掃描「解析度 × gap」，每組結果寫入 CSV；`mrm_sweep_analysis.xlsx` 讀取這份 CSV，自動算出收斂判定與衍生數值。為什麼要掃這兩個參數、它們的定義與對設計的影響，見第 10 節。
+`sweep_resolution_gap.py` 批次掃描「環半徑 R × 間隙 gap × 解析度」，每組結果寫入 CSV；`mrm_sweep_analysis.xlsx` 讀取這份 CSV，自動算出收斂判定與衍生數值。為什麼要掃這幾個參數、它們的定義與對設計的影響，見第 10 節。
 
 ```bash
-# 解析度收斂測試（gap 固定）
+# 解析度收斂測試（gap、R 固定）
 python sweep_resolution_gap.py --resolutions 25 40 50 --gaps 0.20
 
-# gap 掃描（解析度固定）
+# gap 掃描（解析度、R 固定）
 python sweep_resolution_gap.py --resolutions 40 --gaps 0.10 0.12 0.15 0.20
+
+# R 掃描：R 大時每組很慢，建議先從 4、5 開始
+python sweep_resolution_gap.py --Rs 4 5 --gaps 0.12 --resolutions 25
 ```
 
+**掃 R 的做法。** R 一變，共振位置會跑得很遠，無法預測（見第 8 節）。所以這個模式不放窗口在預測位置，而是：
+
+- 窗口取 1.1 個 FSR 寬（`FSR = λ² / (n_g · 2πR)`，`n_g` 預設 2.9，可用 `--ng-est` 調整），窗口中心設在 `--target-nm`（預設 1540 nm）；
+- 頻率取樣間隔約 0.02 nm（`--spacing-nm`），頻率點多只增加記憶體，不增加模擬時間；
+- 分析時只取最深的那個凹谷兩側各 0.45 倍 FSR 的資料（`ISOLATE_DIP`），其餘共振丟掉。
+
+模擬時間主要由環內的光漏完要多久決定，與窗口寬度幾乎無關，所以放寬窗口不會變慢。但 R 變大時計算區域變大（面積約隨 R² 增加），Q 通常也變高，每組都會比 R=3 慢。
+
+**其他特性。**
+
 - 每跑完一組就寫入 CSV；中斷後重新執行同一個指令，已有結果的組合會自動跳過。
-- 每組的掃描窗口以上一組有效結果的共振波長為中心（`--center-nm` 指定第一組的位置）。
+- 每組的完整光譜另存到 `sweep_spectra/`，之後可以離線重新分析。
+- 不掃 R 時，每組的掃描窗口以上一組有效結果的共振波長為中心（`--center-nm` 指定第一組的位置）。
 - 無效結果也會寫入並附原因。
-- 目前 CSV **沒有記錄** `DECAY` 與 `NFREQ`（沿用 `PARAMS` 的值），之後建議加入，才能完整重現。
-- 試算表的「掃描資料」分頁從 A5 貼上 CSV 資料列（不含標題列）；「時間估算」分頁可由一次實測推算其他解析度的耗時。
+- 預設輸出 `sweep_results_v2.csv`。舊版（沒有 R 欄）的 CSV 格式不同，程式會拒絕寫入並提示改名備份。
+- 目前 CSV **沒有記錄** `DECAY` 與 `NFREQ`（沿用 `PARAMS` 的值，掃 R 時 `NFREQ` 由窗口寬度決定），之後建議加入，才能完整重現。
+
+**CSV 欄位（共 23 欄，順序與試算表 A~W 欄一致）：** `resolution`、`gap`、`R`、`valid`、`reason`、`window_min_nm`、`window_max_nm`、`lam0_off_nm`、`lam0_on_nm`、`shift_nm`、`fwhm_nm`、`Q`、`Q_fit`、`Q_fit_err`、`Q_harminv`、`ER_dB`、`ER_fit_dB`、`OMA`、`ER_mod_dB`、`IL_dB`、`lam_L_nm`、`retries`、`elapsed_s`。
+
+**試算表。** 「掃描資料」分頁把新資料貼在最後一筆的下一列（不含標題列）。收斂判定改為同時看三項：共振位移、Q、ER 在相鄰解析度之間的變化是否都小於容許值（設定在「說明與設定」分頁，皆為經驗準則）。共振波長 λ₀ 只顯示變化量供參考、不參與判定，因為它隨解析度持續漂移、收斂得很慢，而位移、Q、ER 才是設計比較真正在意的量。「R 彙整」分頁選好 gap 與解析度後，會並排顯示不同 R 的結果。「時間估算」分頁可由一次實測推算其他解析度的耗時。
 
 ## 10. 模擬結果與分析
 
@@ -387,18 +426,18 @@ python sweep_resolution_gap.py --resolutions 40 --gaps 0.10 0.12 0.15 0.20
 
 ### 10.5 量測的可信度與限制
 
-- 淺凹谷的 Q 與 ER 量測誤差大（Q 可能達三成），以半高寬量 Q 在這種條件下不夠穩，建議改用洛倫茲曲線擬合，或用 Meep 的 Harminv 直接由時域訊號求 Q。
+- 淺凹谷的 Q 與 ER 量測誤差大（Q 可能達三成）。**本節的 Q 與 ER 都是用半高寬法量的**；程式現已加入洛倫茲擬合與 Harminv（見第 7.1 節），但還沒有用它們重跑這批資料，所以本節的數字尚未用新方法確認。
 - 共振波長的絕對值隨解析度漂移，尚未收斂。
 - 早期一次試跑（`GAP`=0.15、`DALPHA_ON`=15，設定記錄不完整）曾看到電壓 ON 的凹谷比 OFF 更深，但在欠耦合下，加入損耗理論上應使凹谷變淺，兩者不一致。可能原因是當時 `DECAY` 較鬆，高 Q 的 OFF 凹谷被截斷而偏淺，但這只是假設，未驗證，建議在固定設定下重做 `DALPHA_ON` 測試。
 - 上述所有結果都是 2D 等效折射率近似，尚未與 3D 或實驗比對。
 
 ### 10.6 下一步
 
-1. **掃 R**：例如 R = 4、5、6（gap 約 0.12，解析度 25 到 30 即可看趨勢），看 Q 與 ER 是否明顯上升。R 改變時共振位置會大幅移動，需配合 `predict_center`（目前 `sweep_resolution_gap.py` 尚未支援掃 R，需新增）。
-2. **改善凹谷量測**：洛倫茲擬合或 Harminv。
-3. **完整記錄設定**：CSV 加入 `DECAY`、`NFREQ`。
-4. **調整門檻與收斂判定**：`no_dip` 門檻降到約 0.05 dB；試算表的收斂判定改看位移、Q、ER 的變化，不要用絕對共振波長。
-5. **重做 `DALPHA_ON` 測試**，確認吸收對凹谷深度的影響。
+1. **掃 R**：R = 4、5（之後 6），gap 約 0.12，解析度 25，看 Q 與 ER 是否明顯上升。`sweep_resolution_gap.py --Rs` 已支援，**尚未在真實 Meep 上執行**。
+2. **用新的量測方法重跑**：洛倫茲擬合與 Harminv 已加入程式（合成資料已測試，真實 Meep 未驗證）。建議先用 R=3、gap 0.12、解析度 25 重跑一組，對照 `Q`、`Q_fit`、`Q_harminv` 是否一致。
+3. **完整記錄設定**：CSV 加入 `DECAY`、`NFREQ`（尚未做）。
+4. **調整門檻與收斂判定**：試算表的收斂判定已改看位移、Q、ER 的變化（已完成）；`no_dip` 門檻目前為 0.1 dB，是否再降到約 0.05 dB 視新資料決定。
+5. **重做 `DALPHA_ON` 測試**，確認吸收對凹谷深度的影響（尚未做）。
 
 ## 11. 限制與注意事項
 
@@ -415,8 +454,7 @@ python sweep_resolution_gap.py --resolutions 40 --gaps 0.10 0.12 0.15 0.20
 `evaluate(p)` 接受一組參數字典，回傳指標字典，可直接當作最佳化或機器學習的**前向模擬器**：
 
 ```python
-from micro_ring_modulator_meep import (PARAMS, evaluate, figure_of_merit,
-                                       predict_center)
+from micro_ring_modulator_meep import PARAMS, evaluate, figure_of_merit, predict_center
 
 cache = {}                                  # 參考光譜快取，多次呼叫共用，省掉重複的參考模擬
 p = dict(PARAMS, GAP=0.12)                  # 修改要探索的參數
@@ -425,12 +463,21 @@ m = evaluate(p, ref_cache=cache)            # 回傳 Q、ER_dB、OMA、IL_dB、s
 if m["valid"]:                              # 只有可信的結果才拿來訓練
     score = figure_of_merit(m)              # 單一分數，越大越好
 
-# 改了 R 之後，先預測共振位置再放窗口（lam_ref 是已知結果的 OFF 共振波長，單位 µm）
-center = predict_center(R_new=5.0, R_ref=3.0, lam_ref_um=1.5350)
-m2 = evaluate(dict(PARAMS, R=5.0), ref_cache=cache, center_um=center)
+# 改變 R（變動很大，例如 3 -> 5 µm）：共振位置無法預測，
+# 改成窗口取 1.1 個 FSR 寬，並只分析最深的那個凹谷（做法與 sweep_resolution_gap.py --Rs 相同）
+import numpy as np
+R = 5.0
+fsr = 1.54 ** 2 / (2.9 * 2 * np.pi * R)     # 估算的 FSR (µm)；2.9 是 2D 模型的群折射率
+p = dict(PARAMS, R=R, WVL_MIN=1.54 - 0.55 * fsr, WVL_MAX=1.54 + 0.55 * fsr,
+         NFREQ=1500, ISOLATE_DIP=True, FSR_EST_UM=fsr)
+m2 = evaluate(p, ref_cache=cache)
+
+# R 只小幅變動（約 1% 內）時，才適合用 predict_center 預測共振位置：
+# center = predict_center(R_new=3.03, R_ref=3.0, lam_ref_um=1.5404)
+# m3 = evaluate(dict(PARAMS, R=3.03), ref_cache=cache, center_um=center)
 ```
 
-`figure_of_merit` 對無效設計回傳固定的懲罰分數，而不是 nan，讓最佳化器避開那一區；原因仍保留在 `reason`。其中的加權只是示範，請依實際目標修改。`example_scan_R` 是一個掃描 `R` 並自動追蹤共振的完整範例。
+`figure_of_merit` 對無效設計回傳固定的懲罰分數，而不是 nan，讓最佳化器避開那一區；原因仍保留在 `reason`。其中的加權只是示範，請依實際目標修改。`example_scan_R` 示範小幅掃描 `R` 並用 `predict_center` 追蹤共振（R 大幅變動請用上面的 `ISOLATE_DIP` 做法或 `sweep_resolution_gap.py --Rs`）。
 
 依第 10 節的結果，建議的設計變數是 `R`、`GAP`、`W`、`DN_ON`（其中 `R` 與 `GAP` 最重要）。典型做法有兩種：
 

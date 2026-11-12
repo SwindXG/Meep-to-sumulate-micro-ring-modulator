@@ -33,6 +33,13 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 import meep as mp
 
+# scipy 只用在洛倫茲擬合；沒安裝時擬合結果為 nan，其他功能照常運作
+try:
+    from scipy.optimize import curve_fit
+    HAVE_SCIPY = True
+except ImportError:
+    HAVE_SCIPY = False
+
 
 # ============================================================
 # 1. 參數（全部集中在這裡，之後逆向設計只要改這個 dict）
@@ -51,6 +58,9 @@ PARAMS = dict(
     DN_ON=-0.004,     # 電壓 ON 時的折射率變化 Δn（示意值，之後用 Soref 公式算）
     DALPHA_ON=0.0,    # 電壓 ON 時的額外吸收 Δα (cm^-1)；先設 0，只看折射率造成的純位移
     DECAY=1e-6,       # 場衰減到多小才停止模擬（越小越準，但跑越久）
+    USE_HARMINV=True, # 在 OFF 的環模擬中加 Harminv，直接從時域衰減量 Q（比半高寬法可靠）
+    ISOLATE_DIP=False,# True：窗口可以比 FSR 寬，分析時只取最深那個凹谷附近（掃 R 時用）
+    FSR_EST_UM=0.0,   # ISOLATE_DIP=True 時用的 FSR 估計 (µm)；擷取範圍為凹谷兩側各 0.45 倍 FSR
 )
 
 # 穿透率放大圖的 x 軸範圍：兩個凹谷外側各多留幾倍 FWHM（越小畫面越放大）
@@ -107,11 +117,13 @@ def build_geometry(p, with_ring, ring_medium):
 # ============================================================
 # 3. 跑一次模擬，回傳各頻率的穿透功率
 # ============================================================
-def run_spectrum(p, with_ring, ring_medium=None, want_eps=False):
+def run_spectrum(p, with_ring, ring_medium=None, want_eps=False, want_harminv=False):
     """
     with_ring=False -> 參考模擬（只有直波導）
     with_ring=True  -> 有環，環的材料由 ring_medium 決定（OFF / ON 差在這）
-    回傳 (頻率陣列, 穿透功率 flux 陣列, 介電常數圖或 None)
+    want_harminv=True 且有環時，會在環內放一個 Harminv 監測點，直接由時域的衰減量出 Q。
+    回傳 (頻率陣列, 穿透功率 flux 陣列, 介電常數圖或 None, Harminv 模態清單)
+    Harminv 模態清單的每一項是 (波長 µm, Q, 誤差估計, 振幅)；沒用 Harminv 時是空清單。
     """
     bus_y, sx, sy = cell_geometry(p)
 
@@ -154,7 +166,17 @@ def run_spectrum(p, with_ring, ring_medium=None, want_eps=False):
     else:
         decay_pt = mp.Vector3(mon_x, bus_y)
 
-    sim.run(until_after_sources=mp.stop_when_fields_decayed(
+    # --- Harminv：光源關掉後，分析環內一個點的訊號，找出共振頻率與衰減率（Q）---
+    # 光譜法要靠「凹谷夠深」才量得準；Harminv 看的是時域衰減，不受凹谷深淺影響。
+    harminv, step_funcs = None, []
+    if want_harminv and with_ring:
+        try:
+            harminv = mp.Harminv(mp.Ez, mp.Vector3(p["R"], 0), fcen, df)
+            step_funcs.append(mp.after_sources(harminv))   # 只在光源關掉之後才取樣
+        except Exception:                                  # noqa: BLE001（建立失敗就不用 Harminv）
+            harminv = None
+
+    sim.run(*step_funcs, until_after_sources=mp.stop_when_fields_decayed(
         50, mp.Ez, decay_pt, p["DECAY"]))
 
     flux = np.array(mp.get_fluxes(through))
@@ -166,7 +188,16 @@ def run_spectrum(p, with_ring, ring_medium=None, want_eps=False):
         eps = sim.get_array(center=mp.Vector3(),
                             size=mp.Vector3(sx, sy),
                             component=mp.Dielectric)
-    return freqs, flux, eps
+    # 整理 Harminv 找到的模態（取不到就當作沒有，不讓整個模擬失敗）
+    modes = []
+    if harminv is not None:
+        try:
+            for m in harminv.modes:
+                if m.Q > 0 and m.freq > 0:                 # 排除成長或負頻率的假模態
+                    modes.append((1.0 / m.freq, float(m.Q), float(m.err), float(abs(m.amp))))
+        except Exception:                                  # noqa: BLE001
+            modes = []
+    return freqs, flux, eps, modes
 
 
 # ============================================================
@@ -200,6 +231,85 @@ def analyze_dip(wvl, T):
 
     return dict(lam0=lam0, fwhm=fwhm, Q=lam0 / fwhm,
                 ER=10 * np.log10(t_max / max(t_min, 1e-12)))
+
+
+# ------------------------------------------------------------
+# 4a. 更可靠的凹谷量測：洛倫茲擬合 + Harminv
+# ------------------------------------------------------------
+# 為什麼要改：半高寬法只用「最亮點、最暗點、半深度交叉點」幾個點，
+# 凹谷只有 2~3% 深、漣漪約 0.3% 時，最亮點（取最大值）會被漣漪拉高，
+# 半高寬因此偏差，實測同一組設計重跑 Q 差了約 34%。
+# 擬合用凹谷附近全部的點，雜訊會互相平均；並且能給出不確定度。
+
+def lorentz_dip(x, t0, a, x0, g):
+    """洛倫茲凹谷：T = t0 - a / (1 + ((x - x0) / (g/2))^2)。t0 基線、a 深度、x0 中心、g 半高寬。"""
+    return t0 - a / (1.0 + ((x - x0) / (g / 2.0)) ** 2)
+
+
+def fit_dip(wvl, T, m):
+    """
+    對最深的凹谷做洛倫茲擬合。m 是 analyze_dip 的結果（只用來給初始值）。
+    回傳 dict：lam0、fwhm（µm）、Q、ER（dB）、Q_err（Q 的相對 1σ 不確定度）、
+    rms（殘差）、x/y（擬合曲線，畫圖用）。失敗（沒有 scipy、擬合不收斂）時數值為 nan。
+    注意：Q_err 只反映雜訊的隨機部分，漣漪造成的系統偏差不在內。
+    """
+    bad = dict(lam0=np.nan, fwhm=np.nan, Q=np.nan, ER=np.nan, Q_err=np.nan,
+               rms=np.nan, x=None, y=None)
+    if not HAVE_SCIPY:
+        return bad
+
+    i = int(np.argmin(T))
+    lam0 = wvl[i]
+    g0 = m["fwhm"] if np.isfinite(m["fwhm"]) else 5e-4         # 半高寬初始值：量不到就假設 0.5 nm
+    # 只用凹谷附近（兩側各 8 倍半高寬）的點；太少點就用全部
+    sel = np.abs(wvl - lam0) <= 8 * g0
+    if sel.sum() < 15:
+        sel = np.ones_like(wvl, dtype=bool)
+    x_nm = (wvl[sel] - lam0) * 1e3                             # 以 nm 為單位、以凹谷為原點，數值較穩定
+    y = T[sel]
+    far = np.abs(x_nm) > 4 * g0 * 1e3                          # 離凹谷較遠的點用來估基線
+    t0_init = np.median(y[far]) if far.sum() >= 3 else np.max(y)
+    p0 = [t0_init, max(t0_init - T[i], 1e-4), 0.0, g0 * 1e3]
+    dx = np.median(np.diff(x_nm))
+    lower = [0.8, 0.0, x_nm.min(), 0.5 * dx]
+    upper = [1.2, 1.5, x_nm.max(), x_nm.max() - x_nm.min()]
+    try:
+        popt, pcov = curve_fit(lorentz_dip, x_nm, y, p0=p0, bounds=(lower, upper), maxfev=5000)
+    except Exception:                                          # noqa: BLE001（擬合失敗就回傳 nan）
+        return bad
+
+    t0, a, x0, g = popt
+    lam0_fit = lam0 + x0 * 1e-3                                # 回到 µm
+    fwhm = g * 1e-3
+    err = np.sqrt(pcov[3, 3]) / g if np.isfinite(pcov[3, 3]) else np.nan
+    t_min = max(t0 - a, 1e-12)
+    resid = y - lorentz_dip(x_nm, *popt)
+    return dict(lam0=lam0_fit, fwhm=fwhm, Q=lam0_fit / fwhm,
+                ER=10 * np.log10(t0 / t_min), Q_err=float(err),
+                rms=float(np.sqrt(np.mean(resid ** 2))),
+                x=lam0 + x_nm * 1e-3, y=lorentz_dip(x_nm, *popt))
+
+
+def pick_harminv_mode(modes, lam0_um, tol_um=5e-4):
+    """
+    從 Harminv 找到的模態中，挑出離光譜凹谷位置 lam0_um 最近（容許 tol_um）的那一個，
+    多個時取振幅最大的。回傳它的 Q；找不到回傳 nan。
+    """
+    near = [md for md in modes if abs(md[0] - lam0_um) <= tol_um]
+    if not near:
+        return np.nan
+    return max(near, key=lambda md: md[3])[1]
+
+
+def isolate_main_dip(wvl, T_off, T_on, half_width_um):
+    """
+    只保留「OFF 最深的那個凹谷」兩側各 half_width_um 以內的資料。
+    用在窗口比 FSR 寬（窗口內有好幾個共振）的情況：只分析其中一個，其餘丟掉。
+    half_width_um 一般取 0.45 倍 FSR，確保鄰近的共振不會被包進來。
+    """
+    i = int(np.argmin(T_off))
+    keep = np.abs(wvl - wvl[i]) <= half_width_um
+    return wvl[keep], T_off[keep], T_on[keep]
 
 
 def modulator_metrics(wvl, T_off, T_on):
@@ -272,10 +382,24 @@ def check_dip(wvl, T, min_er_db=0.1, edge_frac=0.05, max_T=1.02, multi_frac=0.3)
     if np.isnan(analyze_dip(wvl, T)["fwhm"]):
         return "incomplete"
 
-    # 5. 有幾個凹谷：數「低於門檻」的連續區段
-    level = t_max - multi_frac * (t_max - t_min)
-    below = (T < level).astype(int)
-    n_dips = below[0] + int(np.sum(np.diff(below) == 1))
+    # 5. 有幾個凹谷：數「進入凹谷」的次數。
+    #    用遲滯（兩條線）而不是單一門檻：只用一條線時，雜訊在凹谷側壁的門檻附近來回穿越，
+    #    一個凹谷會被數成好幾個（假的 multi）。這裡要先低於 enter 線才算進入，
+    #    再回升到 leave 線以上才算離開，雜訊小於兩線的間距就不會重複計數。
+    #    淺凹谷（深度 2~3%）和雜訊（約 0.2~0.3%）差不到 10 倍，所以先做 5 點移動平均，
+    #    並用中位數當基線：最大值會被雜訊的正向極端值拉高，門檻跟著抬高，基線上的雜訊就會被當成凹谷。
+    k = 5 if n >= 50 else 1
+    Ts = np.convolve(np.pad(T, (k // 2, k // 2), mode="edge"), np.ones(k) / k, mode="valid")
+    base = np.median(T)                         # 基線（凹谷只佔一小部分，中位數不受影響）
+    depth = base - Ts.min()
+    enter = base - multi_frac * depth           # 低於這條線 -> 進入一個凹谷
+    leave = base - 0.1 * depth                  # 回升到這條線以上 -> 離開凹谷
+    n_dips, inside = 0, False
+    for t in Ts:
+        if not inside and t < enter:
+            n_dips, inside = n_dips + 1, True
+        elif inside and t > leave:
+            inside = False
     if n_dips > 1:
         return "multi"
 
@@ -368,20 +492,31 @@ def plot_structure(eps, p, filename="mrm_structure.png"):
     plt.close(fig)
 
 
-def plot_transmission(wvl, T_off, T_on, m_off, m_on, mod, filename="mrm_transmission.png"):
+def plot_transmission(wvl, T_off, T_on, m_off, m_on, mod, filename="mrm_transmission.png",
+                      zoom=True, xlim=None, fit=None):
     """
     畫穿透率 vs 波長（OFF / ON）。
+    zoom=True : 自動放大到兩個凹谷附近（兩側各留 PLOT_ZOOM 倍 FWHM）；False 則畫完整掃描範圍。
+    xlim      : 手動指定 x 軸範圍 (nm)，例如 (1541, 1547)；優先於 zoom。
+    fit       : fit_dip 的結果；給了就把 OFF 凹谷的洛倫茲擬合曲線疊上去，方便肉眼檢查擬合是否合理。
     上圖：自動放大到兩個凹谷附近，才看得出位移與深度差異。
     下圖：ΔT = T_on - T_off，亮暗差最大的地方就是雷射最佳位置。
     """
     w_nm = wvl * 1000                                        # µm -> nm
     l_off, l_on = m_off["lam0"] * 1000, m_on["lam0"] * 1000  # 兩個共振波長 (nm)
 
-    # --- 決定放大範圍：兩個共振各往外延伸 3 倍 FWHM（量不到 FWHM 就用 2 nm）---
-    fw = np.nanmax([m_off["fwhm"], m_on["fwhm"]]) * 1000
-    pad = 3 * fw if np.isfinite(fw) else 2.0
-    lo, hi = min(l_off, l_on) - pad, max(l_off, l_on) + pad
+    # --- 決定 x 軸範圍 ---
+    if xlim is not None:                                     # 手動指定（最優先）
+        lo, hi = xlim
+    elif zoom:                                               # 自動放大：共振兩側各留 PLOT_ZOOM 倍 FWHM
+        fw = np.nanmax([m_off["fwhm"], m_on["fwhm"]]) * 1000
+        pad = PLOT_ZOOM * fw if np.isfinite(fw) else 2.0     # 量不到 FWHM 就固定留 2 nm
+        lo, hi = min(l_off, l_on) - pad, max(l_off, l_on) + pad
+    else:                                                    # 完整掃描範圍
+        lo, hi = w_nm.min(), w_nm.max()
     keep = (w_nm >= lo) & (w_nm <= hi)                       # 範圍內的資料點
+    if not keep.any():                                       # 手動範圍內沒有資料時退回全部
+        keep = np.ones_like(w_nm, dtype=bool)
     y_low = min(T_off[keep].min(), T_on[keep].min())
 
     fig, (ax, ax2) = plt.subplots(
@@ -391,13 +526,16 @@ def plot_transmission(wvl, T_off, T_on, m_off, m_on, mod, filename="mrm_transmis
     # --- 上圖：穿透率 ---
     ax.plot(w_nm, T_off, color="tab:red", lw=1.8, label="Voltage OFF")
     ax.plot(w_nm, T_on, color="tab:green", lw=1.8, ls="--", label="Voltage ON")
+    if fit is not None and fit.get("x") is not None:        # 疊上洛倫茲擬合曲線（OFF）
+        ax.plot(fit["x"] * 1000, fit["y"], color="k", lw=1.0, ls=":",
+                label=f"Lorentz fit (Q = {fit['Q']:.0f})")
     ax.axvline(l_off, color="tab:red", ls=":", lw=0.8)       # OFF 共振位置
     ax.axvline(l_on, color="tab:green", ls=":", lw=0.8)      # ON 共振位置
     ax.set_xlim(lo, hi)
     ax.set_ylim(max(0.0, y_low - 0.05), 1.03)
     ax.set_ylabel("Transmission T")
     ax.set_title(f"Resonance shift = {l_on - l_off:+.2f} nm   "
-                 f"(Q_off = {m_off['Q']:.0f}, Q_on = {m_on['Q']:.0f})", pad=30)
+                 f"(Q_off = {m_off['Q']:.0f}, Q_on = {m_on['Q']:.0f})", pad=48)   # pad 留給兩列圖例
     ax.grid(alpha=0.3)
 
     # --- 下圖：ΔT = T_on - T_off ---
@@ -417,7 +555,7 @@ def plot_transmission(wvl, T_off, T_on, m_off, m_on, mod, filename="mrm_transmis
         ax2.axvline(lam_L, color="k", ls="-.", lw=1)
 
     # 圖例放在標題下方、圖框外，避免擋住凹谷
-    ax.legend(loc="lower center", bbox_to_anchor=(0.5, 1.0), ncol=3,
+    ax.legend(loc="lower center", bbox_to_anchor=(0.5, 1.0), ncol=2,
               fontsize=8, frameon=False)
     fig.tight_layout()
     fig.savefig(filename, dpi=200)
@@ -428,13 +566,13 @@ def plot_transmission(wvl, T_off, T_on, m_off, m_on, mod, filename="mrm_transmis
 # 6. 完整流程（包成函式，逆向設計直接呼叫 evaluate）
 # ============================================================
 # evaluate 回傳的欄位（無效時數值欄位為 nan，欄位固定，方便存成表格）
-METRIC_KEYS = ("lam0_off_nm", "lam0_on_nm", "shift_nm", "fwhm_nm", "Q", "ER_dB",
-               "OMA", "ER_mod_dB", "IL_dB", "lam_L_nm")
+METRIC_KEYS = ("lam0_off_nm", "lam0_on_nm", "shift_nm", "fwhm_nm", "Q", "Q_fit", "Q_fit_err",
+               "Q_harminv", "ER_dB", "ER_fit_dB", "OMA", "ER_mod_dB", "IL_dB", "lam_L_nm")
 
 
 def _simulate_once(p, make_plots, ref_cache):
     """
-    跑完「參考 + OFF + ON」三次模擬，回傳 (波長, T_off, T_on, 介電常數圖)。
+    跑完「參考 + OFF + ON」三次模擬，回傳 (波長, T_off, T_on, 介電常數圖, Harminv 模態)。
     參考光譜只和直波導、解析度、掃描窗口有關，所以用 ref_cache 重用：
     只要這些沒變，就不用重跑。（R、GAP 只影響計算區域大小，
     對直波導的功率頻譜影響很小，視為可重用。）
@@ -442,24 +580,26 @@ def _simulate_once(p, make_plots, ref_cache):
     key = (p["W"], p["N_SI"], p["N_CLAD"], p["RESOLUTION"], p["DPML"],
            p["NFREQ"], round(p["WVL_MIN"], 6), round(p["WVL_MAX"], 6))
     if key not in ref_cache:
-        freqs, flux, _ = run_spectrum(p, with_ring=False)
+        freqs, flux, _, _ = run_spectrum(p, with_ring=False)
         ref_cache[key] = (freqs, flux)
     freqs, ref_flux = ref_cache[key]
 
     # 電壓 OFF：環為原本的矽
-    _, off_flux, eps = run_spectrum(p, True, si_medium(p["N_SI"]), want_eps=make_plots)
+    _, off_flux, eps, modes = run_spectrum(
+        p, True, si_medium(p["N_SI"]), want_eps=make_plots,
+        want_harminv=p.get("USE_HARMINV", False))          # Harminv 只在 OFF 的環模擬中使用
     # 電壓 ON：折射率改變 + 額外吸收
-    _, on_flux, _ = run_spectrum(
+    _, on_flux, _, _ = run_spectrum(
         p, True, si_medium(p["N_SI"], p["DN_ON"], p["DALPHA_ON"]))
 
     # 穿透率 = 有環 / 參考；頻率轉波長後，排成由短到長
     wvl = 1 / freqs
     order = np.argsort(wvl)
     return (wvl[order], (off_flux / ref_flux)[order],
-            (on_flux / ref_flux)[order], eps)
+            (on_flux / ref_flux)[order], eps, modes)
 
 
-def evaluate(p, make_plots=False, ref_cache=None, center_um=None, max_retry=2):
+def evaluate(p, make_plots=False, ref_cache=None, center_um=None, max_retry=2, spectra_out=None):
     """
     給一組參數 p，回傳指標 dict。逆向設計時每組設計都呼叫這個函式。
 
@@ -468,6 +608,7 @@ def evaluate(p, make_plots=False, ref_cache=None, center_um=None, max_retry=2):
     ref_cache  : 空 dict；多次呼叫時傳同一個，可重用參考光譜省時間
     center_um  : 預測的共振位置 (µm)，會把掃描窗口移到以它為中心（見 predict_center）
     max_retry  : 檢查不合格時，最多自動修正並重跑幾次
+    spectra_out: 檔名（.npz）；給了就把完整光譜存起來，之後可以不重跑 Meep 而重新分析
 
     回傳 dict 內固定有：
       valid  : True 才代表數字可信；False 時其他數值僅供除錯，不要拿去訓練
@@ -485,9 +626,16 @@ def evaluate(p, make_plots=False, ref_cache=None, center_um=None, max_retry=2):
     for attempt in range(max_retry + 1):
         # --- 第一層：模擬失敗（當機、記憶體不足等）也要當成「無效」，不要讓批次中斷 ---
         try:
-            wvl, T_off, T_on, eps = _simulate_once(p, make_plots, ref_cache)
+            wvl_full, Toff_full, Ton_full, eps, modes = _simulate_once(p, make_plots, ref_cache)
         except Exception as e:                  # noqa: BLE001（刻意攔下所有錯誤）
             return _invalid_result(p, attempt, f"模擬失敗: {e}")
+
+        # --- 窗口比 FSR 寬時，只取最深的那個凹谷附近來分析（掃 R 用）---
+        if p.get("ISOLATE_DIP") and p.get("FSR_EST_UM", 0) > 0:
+            wvl, T_off, T_on = isolate_main_dip(wvl_full, Toff_full, Ton_full,
+                                                0.45 * p["FSR_EST_UM"])
+        else:
+            wvl, T_off, T_on = wvl_full, Toff_full, Ton_full
 
         # --- 第二層：檢查 OFF 與 ON 兩條光譜 ---
         c_off, c_on = check_dip(wvl, T_off), check_dip(wvl, T_on)
@@ -511,20 +659,27 @@ def evaluate(p, make_plots=False, ref_cache=None, center_um=None, max_retry=2):
     # 算指標（無效時仍會算，但數字只供除錯）
     m_off, m_on = analyze_dip(wvl, T_off), analyze_dip(wvl, T_on)
     mod = modulator_metrics(wvl, T_off, T_on)
+    fit = fit_dip(wvl, T_off, m_off)                         # 洛倫茲擬合（OFF 的凹谷）
+    q_harminv = pick_harminv_mode(modes, m_off["lam0"])      # Harminv 量到的 Q
     metrics = dict(
         valid=valid, reason=reason, retries=attempt,
         window_nm=(p["WVL_MIN"] * 1e3, p["WVL_MAX"] * 1e3),
         lam0_off_nm=m_off["lam0"] * 1e3, lam0_on_nm=m_on["lam0"] * 1e3,
         shift_nm=(m_on["lam0"] - m_off["lam0"]) * 1e3,
-        fwhm_nm=m_off["fwhm"] * 1e3, Q=m_off["Q"], ER_dB=m_off["ER"],
+        fwhm_nm=m_off["fwhm"] * 1e3, Q=m_off["Q"], Q_fit=fit["Q"], Q_fit_err=fit["Q_err"],
+        Q_harminv=q_harminv, ER_dB=m_off["ER"], ER_fit_dB=fit["ER"],
         OMA=mod["OMA"], ER_mod_dB=mod["ER_mod"], IL_dB=mod["IL"],
         lam_L_nm=mod["lam_L"] * 1e3)
 
     # 只讓主程序存檔（用 MPI 平行時避免每個 rank 都寫檔）
     if make_plots and mp.am_master():
         plot_structure(eps, p)
-        plot_transmission(wvl, T_off, T_on, m_off, m_on, mod)
-        np.savez("mrm_spectra.npz", wvl_um=wvl, T_off=T_off, T_on=T_on)
+        plot_transmission(wvl, T_off, T_on, m_off, m_on, mod, fit=fit)
+        plot_transmission(wvl, T_off, T_on, m_off, m_on, mod,
+                          filename="mrm_transmission_full.png", zoom=False)   # 完整範圍總覽
+        np.savez("mrm_spectra.npz", wvl_um=wvl_full, T_off=Toff_full, T_on=Ton_full)
+    if spectra_out and mp.am_master():                      # 完整光譜另存，之後可離線重新分析
+        np.savez(spectra_out, wvl_um=wvl_full, T_off=Toff_full, T_on=Ton_full)
     return metrics
 
 
@@ -554,6 +709,9 @@ def example_scan_R(R_list):
     """
     示範（main 不會自動執行）：掃描不同的環半徑 R，並用上一組有效結果
     預測下一組的共振位置，讓掃描窗口跟著共振走。
+    注意：predict_center 假設「同一個階數 m」，R 只能小幅變動（約 1% 內）。
+    R 變動很大時（例如 3 -> 4 -> 5 µm）同一階的共振會跑到幾百 nm 外，
+    請改用 sweep_resolution_gap.py 的 --Rs 選項（窗口取一個 FSR 寬）。
     用法：rows = example_scan_R([2.9, 3.0, 3.05])
     """
     cache, rows, last = {}, [], None            # last = (R, OFF 共振波長 µm)
