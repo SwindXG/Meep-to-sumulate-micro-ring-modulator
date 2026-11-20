@@ -45,15 +45,15 @@ except ImportError:
 # 1. 參數（全部集中在這裡，之後逆向設計只要改這個 dict）
 # ============================================================
 PARAMS = dict(
-    R=4.0,            # 環「中心線」半徑 (µm)
+    R=3.0,            # 環「中心線」半徑 (µm)
     W=0.5,            # 波導寬度 (µm)，環與直波導相同
-    GAP=0.15,         # 直波導與環邊緣之間的間隙 (µm)；加大 -> 耦合變弱、凹谷更深更窄
+    GAP=0.20,         # 直波導與環邊緣之間的間隙 (µm)；加大 -> 耦合變弱、凹谷更深更窄
     N_SI=2.8,         # 矽的等效折射率（2D 近似）
     N_CLAD=1.44,      # 包覆層 SiO2 的折射率
-    WVL_MIN=1.535,    # 掃描波長下限 (µm)：只涵蓋 OFF 與 ON 的那一組共振
-    WVL_MAX=1.555,    # 掃描波長上限 (µm)：範圍要小於 FSR（約 41~44 nm），避免抓到別的共振
+    WVL_MIN=1.525,    # 掃描波長下限 (µm)：只涵蓋 OFF 與 ON 的那一組共振
+    WVL_MAX=1.545,    # 掃描波長上限 (µm)：範圍要小於 FSR（約 41~44 nm），避免抓到別的共振
     NFREQ=1200,       # 頻率取樣點數（20 nm / 1200 ≈ 0.017 nm 間隔）
-    RESOLUTION=25,    # 每 µm 的像素數（40 -> 25 nm/像素）
+    RESOLUTION=40,    # 每 µm 的像素數（40 -> 25 nm/像素）
     DPML=1.0,         # PML 吸收邊界厚度 (µm)
     DN_ON=-0.004,     # 電壓 ON 時的折射率變化 Δn（示意值，之後用 Soref 公式算）
     DALPHA_ON=0.0,    # 電壓 ON 時的額外吸收 Δα (cm^-1)；先設 0，只看折射率造成的純位移
@@ -482,10 +482,45 @@ def plot_structure(eps, p, filename="mrm_structure.png"):
     ax.axvline(-sx / 2 + d + 0.5, color="tab:red", ls="--", label="source")
     ax.axvline(sx / 2 - d - 0.5, color="tab:blue", ls="--", label="through monitor")
 
+    # ---------- 在圖上標示結構參數（每次畫圖都從 p 自動帶入，不用手動改） ----------
+    R, W, gap = p["R"], p["W"], p["GAP"]
+    # 標註箭頭與文字的共同樣式：橘色雙箭頭
+    arrow = dict(arrowstyle="<->", color="tab:orange", lw=1.6, shrinkA=0, shrinkB=0)
+    box = dict(boxstyle="round,pad=0.2", fc="white", ec="none", alpha=0.85)
+    label = dict(color="tab:orange", fontsize=10, fontweight="bold", bbox=box)
+
+    # R：從環心 (0,0) 畫到環的中心線（45 度方向），文字標在線段旁
+    c45 = np.cos(np.pi / 4)
+    ax.annotate("", xy=(R * c45, R * c45), xytext=(0, 0), arrowprops=arrow)
+    ax.text(R * c45 / 2 - 0.15, R * c45 / 2 + 0.25, f"R = {R} µm", ha="right", **label)   # 放在箭頭左上方（環內空白處）
+
+    # W：環最上方的截面，從內緣量到外緣；文字放在右上側避免遮住環
+    ax.annotate("", xy=(0, R + W / 2), xytext=(0, R - W / 2), arrowprops=arrow)
+    ax.text(0.4, R + W / 2 + 0.3, f"W = {W} µm", va="bottom", **label)
+
+    # gap：環外緣 (y = -(R+W/2)) 到直波導上緣的距離；gap 很小，文字用引線拉到旁邊
+    y_ring_out = -(R + W / 2)
+    ax.annotate("", xy=(0, y_ring_out - gap), xytext=(0, y_ring_out), arrowprops=arrow)
+    ax.annotate(f"gap = {gap} µm", xy=(0, y_ring_out - gap / 2),
+                xytext=(R + 0.9, y_ring_out + 0.45), ha="center", arrowprops=dict(arrowstyle="-", color="tab:orange", lw=1.0),
+                **label)
+
+    # 材料與折射率：矽標在環旁、SiO2 標在環心（背景區）
+    ax.text(0, -1.0, f"SiO$_2$ cladding\n$n_{{SiO_2}}$ = {p['N_CLAD']}", ha="center", va="center",
+            fontsize=9, bbox=box)
+    ax.annotate(f"Si ring\n$n_{{Si}}$ = {p['N_SI']}", xy=(-R - W / 2, 0), xytext=(-5.0, -1.5),
+                ha="center", va="center", fontsize=9, bbox=box,
+                arrowprops=dict(arrowstyle="->", color="black", lw=0.8))
+
+    # 參數總表：放在左上角（計算區的空角落，不會擋到結構）
+    info = (f"R = {R} µm\nW = {W} µm\ngap = {gap} µm\n"
+            f"$n_{{Si}}$ = {p['N_SI']}\n$n_{{SiO_2}}$ = {p['N_CLAD']}")
+    ax.text(0.02, 0.98, info, transform=ax.transAxes, ha="left", va="top", fontsize=9,
+            bbox=dict(boxstyle="round", fc="white", ec="gray", alpha=0.9))
+
     ax.set_xlabel("x (µm)")
     ax.set_ylabel("y (µm)")
-    ax.set_title(f"Micro-ring structure (R={p['R']} µm, W={p['W']} µm, "
-                 f"gap={p['GAP']} µm)")
+    ax.set_title("Micro-ring structure")               # 數值已標在圖上，標題不再重複
     ax.legend(loc="upper right", fontsize=8)
     fig.tight_layout()
     fig.savefig(filename, dpi=200)
