@@ -45,7 +45,7 @@ import time
 import numpy as np
 import meep as mp
 
-from micro_ring_modulator_meep import PARAMS, evaluate
+from micro_ring_modulator_meep import PARAMS, evaluate, resolve_pn_params
 
 # CSV 欄位（順序必須與試算表「掃描資料」分頁的 A~W 欄一致）
 FIELDS = ["resolution", "gap", "R", "valid", "reason", "window_min_nm", "window_max_nm",
@@ -61,6 +61,7 @@ COPY_KEYS = ["valid", "reason", "lam0_off_nm", "lam0_on_nm", "shift_nm", "fwhm_n
 
 def make_key(resolution, gap, R):
     """把 (解析度, gap, R) 轉成可比較的鍵，避免 0.2 與 0.2000001 被當成不同組合。"""
+    # 解析度取整數；gap 四捨五入到 0.1 nm（4 位小數）；R 四捨五入到 1 nm（3 位小數）
     return int(resolution), round(float(gap), 4), round(float(R), 3)
 
 
@@ -108,10 +109,12 @@ def fsr_window(R, target_um, ng_est, window_fsr, spacing_nm):
     回傳 (WVL_MIN, WVL_MAX, NFREQ, FSR)，長度單位 µm。
     NFREQ 依「頻率間隔約 spacing_nm」決定（頻率點多只增加記憶體，不增加模擬時間）。
     """
-    fsr = target_um ** 2 / (ng_est * 2 * np.pi * R)
-    width = window_fsr * fsr
+    fsr = target_um ** 2 / (ng_est * 2 * np.pi * R)    # FSR = λ² / (n_g · 環周長)，單位 µm
+    width = window_fsr * fsr                           # 窗口寬度 = window_fsr 倍 FSR（預設 1.1，確保至少有一個完整共振）
+    # 頻率點數 = 窗口寬度 (nm) / 想要的間隔 (nm)，再限制在 600~5000 之間：
+    # 少於 600 點光譜太粗；多於 5000 點記憶體與 flux 監測的計算量變大，但解析度已不再有幫助
     nfreq = int(np.clip(np.ceil(width * 1e3 / spacing_nm), 600, 5000))
-    return target_um - width / 2, target_um + width / 2, nfreq, fsr
+    return target_um - width / 2, target_um + width / 2, nfreq, fsr   # 窗口以 target_um 為中心左右對稱
 
 
 def main():
@@ -121,7 +124,7 @@ def main():
     ap.add_argument("--gaps", nargs="+", type=float, default=[0.20], help="要測試的 gap (µm)")
     ap.add_argument("--Rs", nargs="+", type=float, default=None,
                     help="要測試的環半徑 (µm)；有給就進入「掃 R」模式（窗口取 1.1 個 FSR 寬）")
-    ap.add_argument("--out", default="sweep_results_v2.csv", help="輸出的 CSV 檔名")
+    ap.add_argument("--out", default="sweep_results_pn.csv", help="輸出的 CSV 檔名")
     ap.add_argument("--spectra-dir", default="sweep_spectra", help="存放每組完整光譜 (.npz) 的資料夾")
     ap.add_argument("--center-nm", type=float, default=1540.4,
                     help="（不掃 R 時）第一組的掃描窗口中心 (nm)；預設取自先前實測的 OFF 共振位置")
@@ -139,6 +142,14 @@ def main():
     R_list = args.Rs if sweep_R else [PARAMS["R"]]
 
     done = load_done(args.out)          # 讀一次就好（MPI 時避免各 rank 讀到不同內容）
+    if mp.am_master():
+        # CSV 沒有記錄 PN 參數；提醒使用者：同一個 CSV 內所有列要用同一組 PN 參數
+        # （舊的 sweep_results_v2.csv 是用整個環均勻 Δn=-0.004 的舊版簡化跑的，不要接著寫）
+        rp = resolve_pn_params(PARAMS)           # PN_FROM_PHYSICS=True 時，這裡是由偏壓與摻雜算出來的值
+        print(f"PN 參數：V_REV={PARAMS['V_REV']} V, NA={PARAMS['NA']:.1e}, ND={PARAMS['ND']:.1e} cm^-3, "
+              f"ON 環帶寬 {rp['W_DEPL_ON']:.4f} µm（OFF 不放環帶）, DN_DEPL={rp['DN_DEPL']:.3e}, "
+              f"ALPHA_DOPE={PARAMS['ALPHA_DOPE']}, X_JUNC={PARAMS['X_JUNC']}"
+              f"（{args.out} 若是用別的 PN 參數或舊版簡化跑的，請改用新的 --out 檔名）")
     cache = {}                          # 參考光譜快取，傳給 evaluate 共用
     center_um = args.center_nm / 1000   # 不掃 R 時：目前的窗口中心 (µm)
     if mp.am_master():
