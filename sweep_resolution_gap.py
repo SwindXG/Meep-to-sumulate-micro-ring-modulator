@@ -49,14 +49,12 @@ from micro_ring_modulator_meep import PARAMS, evaluate, resolve_pn_params
 
 # CSV 欄位（順序必須與試算表「掃描資料」分頁的 A~W 欄一致）
 FIELDS = ["resolution", "gap", "R", "valid", "reason", "window_min_nm", "window_max_nm",
-          "lam0_off_nm", "lam0_on_nm", "shift_nm", "fwhm_nm", "Q", "Q_fit", "Q_fit_err",
-          "Q_harminv", "ER_dB", "ER_fit_dB", "OMA", "ER_mod_dB", "IL_dB", "lam_L_nm",
+          "lam0_off_nm", "shift_nm", "ER_dB", "phase_eff_rad_per_V", "VpiL_Vcm",
           "retries", "elapsed_s"]
 
 # 直接從 evaluate 的回傳值複製的欄位
-COPY_KEYS = ["valid", "reason", "lam0_off_nm", "lam0_on_nm", "shift_nm", "fwhm_nm", "Q",
-             "Q_fit", "Q_fit_err", "Q_harminv", "ER_dB", "ER_fit_dB", "OMA", "ER_mod_dB",
-             "IL_dB", "lam_L_nm", "retries"]
+COPY_KEYS = ["valid", "reason", "lam0_off_nm", "shift_nm", "ER_dB", "phase_eff_rad_per_V",
+             "VpiL_Vcm", "retries"]
 
 
 def make_key(resolution, gap, R):
@@ -173,7 +171,7 @@ def main():
                     continue
 
                 # --- 組合這一組的參數 ---
-                p = dict(PARAMS, RESOLUTION=res, GAP=gap, R=R)
+                p = dict(PARAMS, RESOLUTION=res, GAP=gap, R=R, N_G=args.ng_est)   # 群折射率：窗口與相位效率共用
                 if args.decay is not None:
                     p["DECAY"] = args.decay
                 if sweep_R:
@@ -203,8 +201,8 @@ def main():
                 if mp.am_master():
                     append_row(args.out, row)
                     print(f"[done] R={R}, gap={gap}, resolution={res}: valid={m['valid']}, "
-                          f"Q(半高寬)={m['Q']:.0f}, Q(擬合)={m['Q_fit']:.0f}, "
-                          f"Q(Harminv)={m['Q_harminv']:.0f}, ER={m['ER_dB']:.3f} dB, "
+                          f"ER={m['ER_dB']:.3f} dB, shift={m['shift_nm']:+.4f} nm, "
+                          f"VπL={m['VpiL_Vcm']:.3g} V·cm, "
                           f"耗時 {elapsed / 60:.1f} 分鐘")
 
                 # --- 不掃 R 時，只有可信的結果才拿來更新下一組的窗口中心 ---

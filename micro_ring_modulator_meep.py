@@ -61,12 +61,12 @@ PARAMS = dict(
     N_CLAD=1.44,      # 包覆層 SiO2 的折射率（也是計算區域的背景材料）。
 
     # ================= 掃描窗口與取樣（數值參數）=================
-    WVL_MIN=1.530,    # 掃描波長下限 (µm)：要涵蓋 OFF 與 ON 的共振（解析度 40、R=3 時 OFF 共振約 1535 nm，放在窗口中央）
-    WVL_MAX=1.540,    # 掃描波長上限 (µm)：範圍要小於 FSR（約 41~44 nm），避免抓到別的共振；換解析度或 R 要重設
+    WVL_MIN=1.525,    # 掃描波長下限 (µm)：要涵蓋 OFF 與 ON 的共振（解析度 40、R=3 時 OFF 共振約 1535 nm，放在窗口中央）
+    WVL_MAX=1.545,    # 掃描波長上限 (µm)：範圍要小於 FSR（約 41~44 nm），避免抓到別的共振；換解析度或 R 要重設
                       #   （共振位置會隨解析度漂移數 nm，所以窗口不能一直沿用；見 README 11.1）
     NFREQ=4000,       # 頻率取樣點數（20 nm / 4000 = 0.005 nm 間隔）；PN 位移只有約 0.1 nm，間隔要夠細。
                       #   點數多只增加記憶體，不增加模擬時間；太少會漏掉窄的凹谷。
-    RESOLUTION=25,    # 每 µm 的像素數（40 -> 格點邊長 25 nm）；空乏區只有 0.06~0.12 µm，解析度太低會畫不準。
+    RESOLUTION=40,    # 每 µm 的像素數（40 -> 格點邊長 25 nm）；空乏區只有 0.06~0.12 µm，解析度太低會畫不準。
                       #   耗時約隨解析度的 2.8 次方增加；共振波長會隨解析度漂移（格點色散），所以同一批資料要固定。
     DPML=1.0,         # PML（完美匹配層，吸收邊界）厚度 (µm)。要大於約半個波長，太薄會有反射。
 
@@ -79,16 +79,22 @@ PARAMS = dict(
                            #   算出 DN_DEPL、W_DEPL_OFF、W_DEPL_ON（會蓋掉下面手動填的這三個值）；
                            #   False：直接用下面手動填的 DN_DEPL、W_DEPL_OFF、W_DEPL_ON（不經過物理計算）。
     V_REV=2.0,        # 反向偏壓大小 (V)，填正數（>= 0）。越大空乏區越寬、位移越大；寬度約與 sqrt(Vbi + V) 成正比。
-    NA=5e15,          # p 側受體摻雜濃度 (cm^-3)。常見矽光調變器約 1e17 ~ 1e18。
-    ND=5e15,          # n 側施體摻雜濃度 (cm^-3)。空乏區往濃度「較低」的一側延伸得比較多。
+    NA=5e17,          # p 側受體摻雜濃度 (cm^-3)。常見矽光調變器約 1e17 ~ 1e18。
+    ND=5e17,          # n 側施體摻雜濃度 (cm^-3)。空乏區往濃度「較低」的一側延伸得比較多。
     TAU_MP=3.13e-14,  # 電洞的動量散射（弛豫）時間 τ_mp (s)，視為定值。預設值讓 NA+ND=1e18 時算出的電洞傳導有效質量
                       #   剛好是常用的 0.39 m0（m = qτ/μ 反推）。
     TAU_MN=3.77e-14,  # 電子的動量散射時間 τ_mn (s)，視為定值。預設值讓 NA+ND=1e18 時算出的電子傳導有效質量 = 0.26 m0。
     LAMBDA_PHYS_UM=1.55,  # 計算 Δn 用的工作波長 (µm)（Drude 公式裡的 λ，與掃描窗口分開，只影響 Δn 的大小）
     N_SI_BULK=3.476,  # 計算 Δn 用的「體材矽」折射率（公式裡的 n）；不是 2D 模擬用的等效折射率 N_SI
-    ALPHA_DOPE=7.0,   # 摻雜矽的基線吸收係數 (cm^-1)，OFF 與 ON 的環都有；換算：dB/cm = 4.34 × cm^-1，
+    N_G=2.9,          # 環的群折射率 n_g（無因次），只用來由共振位移換算相位調變效率：
+                      #   FSR = λ²/(n_g·2πR)，環一圈的相位變化 Δφ = 2π·位移/FSR。
+                      #   2.9 是 R=3 µm 時由模擬的 FSR（約 41~44 nm）估出來的值；Meep 窗口只含一個共振時量不到 FSR，
+                      #   所以用這個估計值；n_g 差 10%，相位效率就差 10%。可用 derive_n_eff.py 或兩個相鄰共振的間距重新估。
+    ALPHA_DOPE=7.0,   # （PN_FROM_PHYSICS=False 時才用；True 時由摻雜算出）摻雜矽的基線吸收係數 (cm^-1)，OFF 與 ON 的環都有；換算：dB/cm = 4.34 × cm^-1，
                       #   所以 7 cm^-1 約 30 dB/cm。數值來自摻雜 5e17 cm^-3 的 Soref 估算（示意值，使用前請對照原文）。
                       #   越大：環自身損耗越大（Q_i 越低）、凹谷越寬；它也決定 OFF/ON 的吸收差有多大。
+    ALPHA_DEPL=0.0,   # （PN_FROM_PHYSICS=False 時才用）空乏區的吸收係數 (cm^-1)，不可為負；0 = 載子被掃光、沒有吸收。
+                      #   PN_FROM_PHYSICS=True 時會被「基線吸收 + Δα」算出的值取代，且 ALPHA_DOPE 也改由摻雜算出。
     DN_DEPL=0.0017,   # （PN_FROM_PHYSICS=False 時才用）完全空乏的區域，折射率比摻雜矽高多少（無因次，正值）。同樣來自 5e17 cm^-3、電子電洞都被掃光的
                       #   Soref 估算（示意值）。它乘上「空乏區增加的那一圈所含的光場比例」才是真正的 Δn_eff。
     W_DEPL_OFF=0.06,  # （PN_FROM_PHYSICS=False 時才用）OFF（零偏壓）的空乏區寬度 (µm)，以接面為中心、往兩側各展開一半。
@@ -192,18 +198,37 @@ def pn_carrier_physics(p):
     # 這個 Δn 已經是「相對 0 V」的平均變化，所以模擬時 OFF（0 V）不放環帶、ON 放整個寬度 w_on 的環帶。
     dn_strip = (na * dn_e + nd * dn_h) / (na + nd)
 
+    # ---------- 損耗（自由載子吸收，同樣是 Drude 模型）----------
+    #   Δα = ( e³λ² / (4π²c³ε0 n) ) · [ ΔNe/(m*_ce² μe) + ΔNh/(m*_ch² μh) ]      （單位 m^-1）
+    # 載子增加 (ΔN>0) 損耗變大；載子被掃光 (ΔN<0) 損耗變小，所以空乏區的 Δα 為負。
+    k_abs = Q_E ** 3 * lam ** 2 / (4 * np.pi ** 2 * C_LIGHT ** 3 * EPS0 * p["N_SI_BULK"])
+    mu_e_si, mu_h_si = mu_n * 1e-4, mu_p * 1e-4                        # 遷移率換成 m^2/(V·s)
+    def dalpha_cm(dne_cm3, dnh_cm3):
+        # ΔN 先換成 m^-3；結果 m^-1 再換成 cm^-1（除以 100）
+        return k_abs * (dne_cm3 * 1e6 / (m_ce ** 2 * mu_e_si) + dnh_cm3 * 1e6 / (m_ch ** 2 * mu_h_si)) / 100.0
+    da_e = dalpha_cm(d_ne, 0.0)                                        # n 側（電子）的 Δα (cm^-1)，為負
+    da_h = dalpha_cm(0.0, d_nh)                                        # p 側（電洞）的 Δα (cm^-1)，為負
+    da_strip = (na * da_e + nd * da_h) / (na + nd)                     # 與 Δn 相同的寬度加權平均
+    # 摻雜矽本身的基線吸收：把「全部載子 Nd 個電子、Na 個電洞」代進同一條式子；環的 p、n 各占一半寬度，取平均
+    a_e0, a_h0 = dalpha_cm(nd, 0.0), dalpha_cm(0.0, na)                # 電子、電洞各自的吸收 (cm^-1)
+    alpha_dope = 0.5 * (a_e0 + a_h0)                                   # 環的基線吸收（OFF 與環的其餘部分）
+    # Meep 的吸收不能是負的：空乏環帶的吸收 = 基線 + Δα，下限 0
+    alpha_depl = max(alpha_dope + da_strip, 0.0)
+
     return dict(
         mu_p_cm2Vs=mu_p, mu_n_cm2Vs=mu_n,                              # 步驟一
         m_ch_m0=m_ch / M0, m_ce_m0=m_ce / M0,                          # 步驟二（以 m0 為單位）
         vbi_V=vbi, w_off_um=w_off * 1e6, w_on_um=w_on * 1e6,           # 步驟三：寬度 (µm)
         xp_on_um=xp_on * 1e6, xn_on_um=xn_on * 1e6,
         dNh_cm3=d_nh, dNe_cm3=d_ne,                                    # 步驟三：載子變化 (cm^-3)
-        dn_e=dn_e, dn_h=dn_h, dn_strip=dn_strip)                       # 步驟四：Δn（無因次）
+        dn_e=dn_e, dn_h=dn_h, dn_strip=dn_strip,                       # 步驟四：Δn（無因次）
+        dalpha_e_cm=da_e, dalpha_h_cm=da_h, dalpha_strip_cm=da_strip,  # 損耗變化 Δα (cm^-1)
+        alpha_dope_cm=alpha_dope, alpha_depl_cm=alpha_depl)            # 基線吸收與空乏環帶吸收 (cm^-1)
 
 
 def resolve_pn_params(p):
     """
-    PN_FROM_PHYSICS=True 時，用 pn_carrier_physics 的結果取代 p 裡的 DN_DEPL、W_DEPL_OFF、W_DEPL_ON，
+    PN_FROM_PHYSICS=True 時，用 pn_carrier_physics 的結果取代 p 裡的 DN_DEPL、ALPHA_DOPE、ALPHA_DEPL、W_DEPL_OFF、W_DEPL_ON，
     回傳新的 dict（不改到原本的 p）；False 時原樣回傳。可重複呼叫，結果不變。
     """
     if not p.get("PN_FROM_PHYSICS", False):
@@ -211,6 +236,8 @@ def resolve_pn_params(p):
     r = pn_carrier_physics(p)
     q = dict(p)
     q["DN_DEPL"] = r["dn_strip"]               # 空乏環帶的折射率變化
+    q["ALPHA_DOPE"] = r["alpha_dope_cm"]       # 摻雜矽的基線吸收（由摻雜、遷移率、有效質量算出）
+    q["ALPHA_DEPL"] = r["alpha_depl_cm"]       # 空乏環帶的吸收 = 基線 + Δα（下限 0）
     q["W_DEPL_OFF"] = 0.0                      # 0 V 是 Δn 的基準，OFF 不放環帶（Δn 已是相對 0 V 的變化）
     q["W_DEPL_ON"] = r["w_on_um"]              # 偏壓 V_REV 下的整個空乏區寬度 (µm)，平均 Δn 涵蓋這整段
     return q
@@ -229,6 +256,9 @@ def print_pn_physics(p):
           f"（V = 0 時為 0；Na、Nd 是固定的摻雜）")
     print(f"步驟四  Δn_電子 = {r['dn_e']:+.3e}，Δn_電洞 = {r['dn_h']:+.3e}，"
           f"寬度加權平均 Δn = {r['dn_strip']:+.3e}")
+    print(f"損耗    基線吸收 α_dope = {r['alpha_dope_cm']:.2f} cm^-1（{4.343 * r['alpha_dope_cm']:.1f} dB/cm）；"
+          f"Δα_電子 = {r['dalpha_e_cm']:+.2f}，Δα_電洞 = {r['dalpha_h_cm']:+.2f}，平均 Δα = {r['dalpha_strip_cm']:+.2f} cm^-1；"
+          f"空乏環帶吸收 = {r['alpha_depl_cm']:.2f} cm^-1")
 
 
 # ============================================================
@@ -265,8 +295,8 @@ def si_medium(n0, dn=0.0, dalpha_cm=0.0, wvl=1.55):
 
 
 def depletion_medium(p):
-    """空乏區的材料：載子被掃光，所以沒有吸收；折射率比摻雜矽高 DN_DEPL。"""
-    return si_medium(p["N_SI"], p["DN_DEPL"], 0.0)
+    """空乏區的材料：折射率比摻雜矽高 DN_DEPL；吸收 = ALPHA_DEPL（載子被掃光所以比 ALPHA_DOPE 小，最低 0）。"""
+    return si_medium(p["N_SI"], p["DN_DEPL"], max(p.get("ALPHA_DEPL", 0.0), 0.0))
 
 
 def depletion_edges(p, depl_width):
@@ -535,6 +565,28 @@ def modulator_metrics(wvl, T_off, T_on):
                 IL=-10 * np.log10(max(bright, 1e-12)))
 
 
+def phase_efficiency(shift_um, lam0_um, p):
+    """
+    由共振位移換算「相位調變效率」。回傳 (Δφ, 效率 rad/V, VπL V·cm)。
+    原理：環共振時一圈的相位 = 2π 的整數倍；共振波長移動 Δλ，等於一圈的相位多了
+          Δφ = 2π·Δλ/FSR      （FSR = λ²/(n_g·L)，L = 2πR 是環一圈的長度）
+    指標：
+      效率 η    = Δφ / V_REV              (rad/V)  一圈的相位變化 / 偏壓，越大越好
+      VπL       = V_REV · L · π / |Δφ|    (V·cm)   讓相位變 π 所需的「電壓 × 長度」，越小越好；
+                  這裡 L 取環周長 2πR（因為光在環裡繞很多圈，這是單圈的長度；文獻若用有效長度請另行換算）
+    位移為 0（或量不到）時 VπL 沒有意義，回傳 nan。
+    """
+    if not np.isfinite(shift_um) or not np.isfinite(lam0_um):
+        return np.nan, np.nan, np.nan                           # 量不到位移或共振波長
+    circ_um = 2 * np.pi * p["R"]                                # 環周長 L (µm)
+    fsr_um = lam0_um ** 2 / (p["N_G"] * circ_um)                # 自由頻譜範圍 FSR (µm)
+    dphi = 2 * np.pi * shift_um / fsr_um                        # 一圈的相位變化 Δφ (rad)；位移為正（紅移）時為正
+    v = p["V_REV"]                                              # 偏壓 (V)
+    eta = dphi / v if v > 0 else np.nan                         # 效率 (rad/V)；0 V 沒有意義
+    vpil = v * (circ_um * 1e-4) * np.pi / abs(dphi) if (v > 0 and dphi != 0) else np.nan   # 1 µm = 1e-4 cm
+    return dphi, eta, vpil
+
+
 # ============================================================
 # 4b. 有效性檢查與窗口追蹤（逆向設計時，評估函數必須穩健）
 # ============================================================
@@ -738,9 +790,9 @@ def plot_structure(eps, p, filename="mrm_structure.png"):
     ax.text(R + W / 2 + 0.15, 0.0, "n", color="tab:purple", fontsize=13,
             fontweight="bold", ha="left", va="center")
     # PN 參數：放左下角的空白處
-    pn_info = (f"PN depletion: {p['W_DEPL_OFF']} → {p['W_DEPL_ON']} µm (OFF → ON)\n"
-               f"$\\Delta n_{{depl}}$ = +{p['DN_DEPL']},  "
-               f"$\\alpha_{{dope}}$ = {p['ALPHA_DOPE']} cm$^{{-1}}$")
+    pn_info = (f"PN depletion: {p['W_DEPL_OFF']:.3f} → {p['W_DEPL_ON']:.3f} µm (OFF → ON)\n"
+               f"$\\Delta n_{{depl}}$ = +{p['DN_DEPL']:.2e},  "
+               f"$\\alpha_{{dope}}$ = {p['ALPHA_DOPE']:.2f},  $\\alpha_{{depl}}$ = {p.get('ALPHA_DEPL', 0.0):.2f} cm$^{{-1}}$")
     ax.text(0.02, 0.02, pn_info, transform=ax.transAxes, ha="left", va="bottom", fontsize=8,
             bbox=dict(boxstyle="round", fc="white", ec="gray", alpha=0.9))
 
@@ -795,14 +847,14 @@ def plot_transmission(wvl, T_off, T_on, m_off, m_on, mod, filename="mrm_transmis
     ax.plot(w_nm, T_on, color="tab:green", lw=1.8, ls="--", label="ON (reverse bias)")
     if fit is not None and fit.get("x") is not None:        # 疊上洛倫茲擬合曲線（OFF）
         ax.plot(fit["x"] * 1000, fit["y"], color="k", lw=1.0, ls=":",
-                label=f"Lorentz fit (Q = {fit['Q']:.0f})")
+                label="Lorentz fit (OFF)")
     ax.axvline(l_off, color="tab:red", ls=":", lw=0.8)       # OFF 共振位置
     ax.axvline(l_on, color="tab:green", ls=":", lw=0.8)      # ON 共振位置
     ax.set_xlim(lo, hi)
     ax.set_ylim(max(0.0, y_low - 0.05), 1.03)                # y 軸下緣比最低點再低 0.05；上緣 1.03 讓 T≈1 的線不貼框
     ax.set_ylabel("Transmission T")
-    ax.set_title(f"Resonance shift = {l_on - l_off:+.2f} nm   "
-                 f"(Q_off = {m_off['Q']:.0f}, Q_on = {m_on['Q']:.0f})", pad=48)   # pad 留給兩列圖例
+    ax.set_title(f"Resonance shift = {l_on - l_off:+.3f} nm   (ER = {mod['ER_mod']:.2f} dB)",
+                 pad=48)                                      # pad 留給兩列圖例
     ax.grid(alpha=0.3)
 
     # --- 下圖：ΔT = T_on - T_off ---
@@ -818,7 +870,7 @@ def plot_transmission(wvl, T_off, T_on, m_off, m_on, mod, filename="mrm_transmis
     lam_L = mod["lam_L"] * 1000
     if lo <= lam_L <= hi:
         ax.axvline(lam_L, color="k", ls="-.", lw=1,
-                   label=f"laser {lam_L:.2f} nm (OMA = {mod['OMA']:.2f})")
+                   label=f"laser {lam_L:.2f} nm (ER = {mod['ER_mod']:.2f} dB)")
         ax2.axvline(lam_L, color="k", ls="-.", lw=1)
 
     # 圖例放在標題下方、圖框外，避免擋住凹谷
@@ -833,8 +885,9 @@ def plot_transmission(wvl, T_off, T_on, m_off, m_on, mod, filename="mrm_transmis
 # 6. 完整流程（包成函式，逆向設計直接呼叫 evaluate）
 # ============================================================
 # evaluate 回傳的欄位（無效時數值欄位為 nan，欄位固定，方便存成表格）
-METRIC_KEYS = ("lam0_off_nm", "lam0_on_nm", "shift_nm", "fwhm_nm", "Q", "Q_fit", "Q_fit_err",
-               "Q_harminv", "ER_dB", "ER_fit_dB", "OMA", "ER_mod_dB", "IL_dB", "lam_L_nm")
+# 目前只保留兩個指標：ER_dB（調變消光比）與相位調變效率（phase_eff_rad_per_V、VpiL_Vcm）。
+# lam0_off_nm（OFF 共振波長，掃描時用來追蹤窗口）與 shift_nm（共振位移，相位效率由它算出）是中間量，一併保留。
+METRIC_KEYS = ("lam0_off_nm", "shift_nm", "ER_dB", "phase_eff_rad_per_V", "VpiL_Vcm")
 
 
 def _simulate_once(p, make_plots, ref_cache):
@@ -933,22 +986,22 @@ def evaluate(p, make_plots=False, ref_cache=None, center_um=None, max_retry=2, s
     mod = modulator_metrics(wvl, T_off, T_on)
     fit = fit_dip(wvl, T_off, m_off)                         # 洛倫茲擬合（OFF 的凹谷）
     fit_on = fit_dip(wvl, T_on, m_on)                        # 洛倫茲擬合（ON 的凹谷），只為了量位移
-    q_harminv = pick_harminv_mode(modes, m_off["lam0"])      # Harminv 量到的 Q
     # 位移：PN 的位移只有約 0.1 nm，和頻率取樣間隔（0.005~0.02 nm）同量級，
     # 取離散最低點會有量化誤差；兩邊擬合都成功時，改用兩個擬合中心的差（可以細過取樣間隔）
     if np.isfinite(fit["lam0"]) and np.isfinite(fit_on["lam0"]):
         shift_um = fit_on["lam0"] - fit["lam0"]
     else:
         shift_um = m_on["lam0"] - m_off["lam0"]
+    # 相位調變效率：優先用擬合的 OFF 共振波長，擬合失敗就用離散最低點
+    lam0_ref = fit["lam0"] if np.isfinite(fit["lam0"]) else m_off["lam0"]
+    dphi, eta, vpil = phase_efficiency(shift_um, lam0_ref, p)
     metrics = dict(
         valid=valid, reason=reason, retries=attempt,
         window_nm=(p["WVL_MIN"] * 1e3, p["WVL_MAX"] * 1e3),
-        lam0_off_nm=m_off["lam0"] * 1e3, lam0_on_nm=m_on["lam0"] * 1e3,
-        shift_nm=shift_um * 1e3,
-        fwhm_nm=m_off["fwhm"] * 1e3, Q=m_off["Q"], Q_fit=fit["Q"], Q_fit_err=fit["Q_err"],
-        Q_harminv=q_harminv, ER_dB=m_off["ER"], ER_fit_dB=fit["ER"],
-        OMA=mod["OMA"], ER_mod_dB=mod["ER_mod"], IL_dB=mod["IL"],
-        lam_L_nm=mod["lam_L"] * 1e3)
+        lam0_off_nm=m_off["lam0"] * 1e3,                   # 中間量：窗口追蹤用
+        shift_nm=shift_um * 1e3,                           # 中間量：相位效率由它算出
+        ER_dB=mod["ER_mod"],                               # 指標一：調變消光比（雷射放在 OFF/ON 差最大的波長）
+        phase_eff_rad_per_V=eta, VpiL_Vcm=vpil)            # 指標二：相位調變效率
 
     # 只讓主程序存檔（用 MPI 平行時避免每個 rank 都寫檔）
     if make_plots and mp.am_master():
@@ -973,16 +1026,16 @@ def _invalid_result(p, retries, reason):
 def figure_of_merit(metrics, penalty=-2.0):   # penalty = 無效設計的固定分數，要比任何有效設計的分數都低
     """
     把指標變成「一個分數」（越大越好），給最佳化器用。
-    無效的設計回傳固定的懲罰分數（而不是 nan），讓最佳化器避開那一區；
+    無效的設計（或量不到相位效率）回傳固定的懲罰分數（而不是 nan），讓最佳化器避開那一區；
     原因仍保留在 metrics["reason"]，之後才分得出「真的差」與「量不到」。
 
-    下面的加權只是示範（OMA 越大越好、插入損耗越小越好），
-    請依專題的實際目標修改，例如改成「ER 大於 10 dB 才算合格」。
+    下面的加權只是示範（ER 越大越好、VπL 越小越好），請依專題的實際目標修改，
+    例如改成「ER 大於 3 dB 且 VπL 小於 1 V·cm 才算合格」。
     """
-    if not metrics["valid"]:
+    if not metrics["valid"] or not np.isfinite(metrics["VpiL_Vcm"]):
         return penalty
-    # 0.05 = 插入損耗（dB）的權重：每多 1 dB 損耗扣 0.05 分；OMA 範圍 0~1，所以損耗權重取小一點
-    return metrics["OMA"] - 0.05 * metrics["IL_dB"]
+    # ER 以 3 dB 為一單位、VπL 以 1 V·cm 為一單位，兩者大致同一量級再相減
+    return metrics["ER_dB"] / 3.0 - metrics["VpiL_Vcm"] / 1.0
 
 
 def example_scan_R(R_list):
