@@ -214,6 +214,9 @@ python replot_from_npz.py --xlim 1537 1542      # 手動指定 x 軸範圍 (nm)
 | `NA`、`ND` | 5e17 | 設計 | p 側、n 側摻雜濃度 (cm⁻³) |
 | `TAU_MP`、`TAU_MN` | 3.13e-14、3.77e-14 | 材料 | 電洞、電子的動量散射時間 (s)，視為定值 |
 | `LAMBDA_PHYS_UM`、`N_SI_BULK` | 1.55、3.476 | 材料 | 算 Δn 公式裡的波長與體材矽折射率 |
+| `COMPUTE_EFFECTIVE` | False | 設計 | True：多跑一次 OFF 模擬，用共振場 \|E\|² 做加權平均，算有效折射率變化 Δn_eff 與有效損耗變化 Δα_eff（見 5.3），結果放在 `evaluate` 回傳 dict 的額外鍵，不進 CSV |
+| `EFF_MARGIN` | 0.3 | 數值 | 場加權積分範圍：環的內外緣各外擴多少 (µm)，把消逝場算進分母 |
+| `EFF_EXCLUDE_BUS` | 1.0 | 數值 | 場加權積分時，剔除離直波導上緣這個距離 (µm) 以內的格點，避免直波導的行進波與消逝場混進 \|E\|²；環上的分布沿角度近似均勻，剔除一個扇形不影響比值 |
 | `ALPHA_DOPE` | 7.0 | 設計 | （`PN_FROM_PHYSICS=False` 才用）摻雜矽的基線吸收（cm⁻¹）；True 時由第五步算出 |
 | `ALPHA_DEPL` | 0.0 | 設計 | （同上）空乏環帶的吸收（cm⁻¹，不可為負）；True 時 = 基線 + Δα，下限 0 |
 | `DN_DEPL` | 0.0017 | 設計 | （`PN_FROM_PHYSICS=False` 才用）完全空乏的區域，折射率比摻雜矽高多少（正值，示意值） |
@@ -316,6 +319,42 @@ python replot_from_npz.py --xlim 1537 1542      # 手動指定 x 軸範圍 (nm)
 4. **沒有處理的部分：** 這是 2D 近似，Δn 是體材矽的值，沒有換算成導波模態的等效折射率變化（重疊因子）；p、n 兩側用寬度加權平均成單一折射率環帶，不是左右兩個不同的區域；偏壓不改變 `ALPHA_DOPE`。
 5. `PN_FROM_PHYSICS=True` 時，手填的 `DN_DEPL`、`W_DEPL_OFF`、`W_DEPL_ON` 會被蓋掉（`W_DEPL_OFF` 固定為 0）；掃描時請注意不要中途改 `V_REV`、`NA`、`ND`、`τ`（同第 9.1 節的規則，要改請換新的 `--out`）。
 
+### 5.3 有效折射率與有效損耗（場加權公式）
+
+公式出處見參考文獻 [5]。
+
+```
+Δn_eff = ∬_S Δn_c(x,y)·|E(x,y)|² dxdy / ∬_S |E(x,y)|² dxdy
+Δα_eff = ∬_S Δα_c(x,y)·|E(x,y)|² dxdy / ∬_S |E(x,y)|² dxdy
+```
+
+意思：載子造成的折射率（損耗）變化，只有光場所在的位置才有貢獻，所以用光強 `|E|²` 當權重取平均。程式在 `effective_from_field`（純 numpy 的計算）與 `effective_index_loss`（跑 Meep 取場），把 `COMPUTE_EFFECTIVE` 設成 True 即可使用。
+
+**2D 模型怎麼對應這個公式。** 公式裡的 S 是垂直於傳播方向的截面。我們的 Meep 是 2D，模擬平面是環的俯視圖，光沿環的角度 φ 傳播，所以垂直於傳播方向的截面只剩徑向 r 這一條線，垂直方向（z）已被等效折射率吸收。實作上對環形區域的每個格點取 `|Ez|²`，用 Meep 給的面積權重 `w` 積分（`∬ dA = r dr dφ`），結果等於以 r 為權重的徑向加權平均。2D 的電場只有 Ez（光源是 Ez，TM 偏振），所以 `|E|² = |Ez|²`。
+
+**`Δn_c`、`Δα_c` 的分布。** 取「新增空乏層」（相對 0 V）：接面在 `R + X_JUNC`，p 在內側、n 在外側，偏壓使空乏深度從 0 V 的 `(xp_off, xn_off)` 擴到 `(xp_on, xn_on)`；新增層內載子被掃光（`ΔN = −Na` 或 `−Nd`），其餘位置為 0，且只有矽內才有載子。`Na ≠ Nd` 時兩側新增層的厚度與 `Δn` 都不同，公式自然會處理。
+
+**Meep 怎麼在特定座標取電場。**
+
+| 方法 | 取到什麼 | 用在哪 |
+|---|---|---|
+| `sim.get_field_point(mp.Ez, mp.Vector3(x, y))` | 某一個座標、某一個時刻的場（實數） | 看單點的時域訊號 |
+| `sim.get_array(center=, size=, component=)` | 一塊區域每個格點的瞬間場，或介電常數（`mp.Dielectric`） | 畫結構圖（本程式用來取 ε） |
+| `sim.add_dft_fields(...)` 加 `sim.get_dft_array(dft, mp.Ez, 0)` | 某個頻率的複數場（頻域）：執行期間每個時間步把 `E(t)·e^{iωt}·dt` 累加起來 | **本程式用這個**，因為要的是共振頻率的場分布 |
+
+細節：(1) Meep 的場存在 Yee 格上，Ez、Hx、Hy 各自錯開半格；取值時會線性內插到格點中心，所以座標與陣列對齊。(2) `sim.get_array_metadata(dft=...)` 回傳該區域的格點座標 `x`、`y` 與積分權重 `w`（`∑ f·w ≈ ∬ f dA`），公式的積分直接用它。(3) 用 MPI 平行時，`get_array`、`get_dft_array` 是集體操作，每個 rank 都要呼叫，且每個 rank 都會拿到完整陣列。(4) DFT 只記一個頻率（共振波長），記憶體與時間成本很小；但共振波長要先量出來，所以 `evaluate` 要多跑一次 OFF 模擬。
+
+**直波導的污染。** 直波導裡是強的行進波，消逝場會漏進環與波導之間的縫隙，混進 `|E|²`（分母偏大）。所以積分剔除離直波導上緣 `EFF_EXCLUDE_BUS`（預設 1 µm）以內的所有格點。用合成場測試：直波導場為環場 3 倍時，不剔除會讓 `Δn_eff` 偏小約 5%，剔除後完全消除。這個假設（環上共振場沿角度近似均勻，光源只激發單一方向的行進波）沒有在真實場上驗證。
+
+**位移的對照。** 程式同時給兩個由 `Δn_eff` 換算的位移，可以和 Meep 直接量到的 `shift_nm` 比較：(a) `Δλ ≈ λ·Δn_eff / n_g`（用你的公式與 `N_G`）；(b) 嚴格的一階微擾 `Δλ/λ = ∬ n·Δn·|E|² / ∬ n²·|E|²`（用實際的折射率分布，不需要 `n_g`）。回傳鍵：`dn_eff`、`dalpha_eff_cm`、`gamma_p`、`gamma_n`（光場落在 p、n 側新增層的比例）、`shift_pert_nm`、`shift_pert_eps_nm`。
+
+**驗證狀況與限制：**
+
+1. **只驗證了 numpy 的部分。** 用合成的場（徑向高斯乘方位駐波）算出的結果，與獨立的一維徑向積分一致（`Δn_eff` 差約 1.7%，`Δα_eff` 差約 1.8%）。**取場那一段（`add_dft_fields`、`get_array_metadata`、`get_dft_array`）沒有在真實 Meep 上跑過**，這個容器沒有安裝 Meep，請你先在小解析度跑一次確認。
+2. **新增層很薄。** 預設的新增層厚度約 0.027 µm，在解析度 40 只有約 1 個像素，積分的離散誤差會變大；解析度低時請當趨勢看。
+3. **仍是 2D 近似。** `Δn_c` 是體材矽的值，沒有乘 3D 的垂直重疊（光場落在矽裡的比例），所以 `Δn_eff` 是 2D 等效折射率的變化，絕對值偏大或偏小都有可能，比較不同設計之間的相對值較可信。
+4. **和 Meep 的 ON 幾何略有差別。** ON 模擬用的是「以接面為中心、寬 `W_ON`、平均 Δn」的單一環帶，公式用的是真實的新增層分布。用合成場粗估，兩者的 `Δn_eff` 差約 2% 到 16%（場越窄差越多）。要完全一致，需實作 `Na ≠ Nd` 計畫裡的方案 A（內外兩段環帶），見專案文件 `plan-na-nd-asymmetric-doping.md`。
+
 ## 6. 輸出檔案
 
 | 檔案 | 內容 |
@@ -341,6 +380,8 @@ python replot_from_npz.py --xlim 1537 1542      # 手動指定 x 軸範圍 (nm)
 | 中間量：OFF 共振波長 | `lam0_off_nm` | 掃描時用來追蹤下一組的窗口中心，所以保留。 |
 
 ### 7.1 相位調變效率怎麼算
+
+調變效率與 VπL 的一般定義與文獻比較見參考文獻 [6]。
 
 環共振時，光繞一圈的相位是 2π 的整數倍。共振波長移動 `Δλ`，等於繞一圈的相位多了 `Δφ`：
 
@@ -548,3 +589,5 @@ Meep 每次模擬耗時是主要瓶頸，建議先用低解析度的 2D 版本�
 2. W. Bogaerts et al., "Silicon microring resonators," *Laser & Photonics Reviews*, 2012.（微環共振器的理論、全通環穿透率公式與指標）
 3. A. F. Oskooi et al., "Meep: A flexible free-software package for electromagnetic simulations by the FDTD method," *Computer Physics Communications*, 2010.（Meep 本身）
 4. Meep 官方文件與教學：<https://meep.readthedocs.io/>
+5. Z.-Y. Li, D.-X. Xu, W. R. McKinnon, S. Janz, J. H. Schmid, P. Cheben, and J.-Z. Yu, "Silicon waveguide modulator based on carrier depletion in periodically interleaved PN junctions," *Optics Express*, vol. 17, no. 18, pp. 15947–15958, 2009. DOI: 10.1364/OE.17.015947.（有效折射率與有效損耗：以光場 \|E\|² 加權平均載子造成的 Δn、Δα，見 5.3）
+6. A. Rahim, A. Hermans, B. Wohlfeil, D. Petousi, B. Kuyken, D. Van Thourhout, and R. Baets, "Taking silicon photonics modulators to a higher performance level: state-of-the-art and a review of new technologies," *Advanced Photonics*, vol. 3, no. 2, 024003, 2021. DOI: 10.1117/1.AP.3.2.024003.（調變效率：相位調變效率與 VπL 的定義與比較，見 7.1）

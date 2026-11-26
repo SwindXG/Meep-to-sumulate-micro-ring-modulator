@@ -86,6 +86,11 @@ PARAMS = dict(
     TAU_MN=3.77e-14,  # 電子的動量散射時間 τ_mn (s)，視為定值。預設值讓 NA+ND=1e18 時算出的電子傳導有效質量 = 0.26 m0。
     LAMBDA_PHYS_UM=1.55,  # 計算 Δn 用的工作波長 (µm)（Drude 公式裡的 λ，與掃描窗口分開，只影響 Δn 的大小）
     N_SI_BULK=3.476,  # 計算 Δn 用的「體材矽」折射率（公式裡的 n）；不是 2D 模擬用的等效折射率 N_SI
+    COMPUTE_EFFECTIVE=False,  # True：evaluate 在 OFF 共振波長多跑一次模擬，取出共振場 |E|²，用「場加權平均」公式算
+                      #   有效折射率變化 Δn_eff 與有效損耗變化 Δα_eff（見 effective_index_loss）。會多花約一次 OFF 模擬的時間，
+                      #   所以預設關閉；只在 PN_FROM_PHYSICS=True 時有意義。結果放在 evaluate 回傳 dict 的額外鍵，不進 CSV。
+    EFF_MARGIN=0.3,   # 場加權積分的範圍：環的內外緣各再外擴多少 (µm)。外擴是為了把穿出矽外的消逝場也算進分母；
+                      #   太大會碰到直波導（程式會把直波導的格點剔除），太小會漏掉消逝場。
     N_G=2.9,          # 環的群折射率 n_g（無因次），只用來由共振位移換算相位調變效率：
                       #   FSR = λ²/(n_g·2πR)，環一圈的相位變化 Δφ = 2π·位移/FSR。
                       #   2.9 是 R=3 µm 時由模擬的 FSR（約 41~44 nm）估出來的值；Meep 窗口只含一個共振時量不到 FSR，
@@ -214,6 +219,12 @@ def pn_carrier_physics(p):
     alpha_dope = 0.5 * (a_e0 + a_h0)                                   # 環的基線吸收（OFF 與環的其餘部分）
     # Meep 的吸收不能是負的：空乏環帶的吸收 = 基線 + Δα，下限 0
     alpha_depl = max(alpha_dope + da_strip, 0.0)
+    # 「新增空乏層」內的 Δn、Δα（相對 0 V，層內載子完全被掃光，ΔN = −Na 或 −Nd）：
+    # 場加權公式要的是 Δn_c(x,y) 的真實分布，所以另外留一份「層內」的值（不是上面的平均值）
+    dn_e_full = -k_drude * (-nd * 1e6) / m_ce                          # n 側新增層的 Δn（正）
+    dn_h_full = -k_drude * (-na * 1e6) / m_ch                          # p 側新增層的 Δn（正）
+    da_e_full = dalpha_cm(-nd, 0.0)                                    # n 側新增層的 Δα (cm^-1，負)
+    da_h_full = dalpha_cm(0.0, -na)                                    # p 側新增層的 Δα (cm^-1，負)
 
     return dict(
         mu_p_cm2Vs=mu_p, mu_n_cm2Vs=mu_n,                              # 步驟一
@@ -223,7 +234,10 @@ def pn_carrier_physics(p):
         dNh_cm3=d_nh, dNe_cm3=d_ne,                                    # 步驟三：載子變化 (cm^-3)
         dn_e=dn_e, dn_h=dn_h, dn_strip=dn_strip,                       # 步驟四：Δn（無因次）
         dalpha_e_cm=da_e, dalpha_h_cm=da_h, dalpha_strip_cm=da_strip,  # 損耗變化 Δα (cm^-1)
-        alpha_dope_cm=alpha_dope, alpha_depl_cm=alpha_depl)            # 基線吸收與空乏環帶吸收 (cm^-1)
+        alpha_dope_cm=alpha_dope, alpha_depl_cm=alpha_depl,            # 基線吸收與空乏環帶吸收 (cm^-1)
+        xp_off_um=xp_off * 1e6, xn_off_um=xn_off * 1e6,                # 0 V 的空乏深度（新增層的內緣）
+        dn_e_full=dn_e_full, dn_h_full=dn_h_full,                      # 新增層內的 Δn（n 側、p 側）
+        dalpha_e_full_cm=da_e_full, dalpha_h_full_cm=da_h_full)        # 新增層內的 Δα (cm^-1)
 
 
 def resolve_pn_params(p):
@@ -343,12 +357,14 @@ def build_geometry(p, with_ring, ring_medium, depl_width=0.0):
 # 3. 跑一次模擬，回傳各頻率的穿透功率
 # ============================================================
 def run_spectrum(p, with_ring, ring_medium=None, want_eps=False, want_harminv=False,
-                 depl_width=0.0):
+                 depl_width=0.0, field_wvl_um=None, fields_out=None):
     """
     with_ring=False -> 參考模擬（只有直波導）
     with_ring=True  -> 有環，環的（摻雜矽）材料由 ring_medium 決定
     depl_width      -> 空乏區寬度 (µm)；OFF 與 ON 的差別就在這（OFF 窄、ON 寬）
     want_harminv=True 且有環時，會在環內放一個 Harminv 監測點，直接由時域的衰減量出 Q。
+    field_wvl_um、fields_out：兩個都給（且有環）時，另外在環附近的方形區域記錄波長 field_wvl_um 的
+        Ez 頻域場（DFT），把 x、y 座標、積分權重 w、複數場 Ez 放進 fields_out 這個 dict（見 effective_index_loss）。
     回傳 (頻率陣列, 穿透功率 flux 陣列, 介電常數圖或 None, Harminv 模態清單)
     Harminv 模態清單的每一項是 (波長 µm, Q, 誤差估計, 振幅)；沒用 Harminv 時是空清單。
     """
@@ -409,6 +425,20 @@ def run_spectrum(p, with_ring, ring_medium=None, want_eps=False, want_harminv=Fa
         except Exception:                                  # noqa: BLE001（建立失敗就不用 Harminv）
             harminv = None
 
+    # --- 選擇性：在環附近記錄共振頻率的 Ez 頻域場（DFT）---
+    # Meep 取場的三種方式：
+    #   sim.get_field_point(Ez, 點)           ：取「某一個座標」的瞬間場（時域，實數）；
+    #   sim.get_array(center, size, 分量)      ：取「一塊區域」每個格點的瞬間場／介電常數；
+    #   sim.add_dft_fields + get_dft_array    ：執行期間每個時間步把 E(t)·e^{iωt}·dt 累加起來，
+    #                                           得到「某個頻率」的複數場（頻域），共振模態的形狀就是它。
+    # 這裡用第三種，因為要的是共振頻率的場分布 E(x,y)，不是某個瞬間的場。
+    field_dft = None
+    if field_wvl_um is not None and fields_out is not None and with_ring:
+        half = p["R"] + p["W"] / 2 + p.get("EFF_MARGIN", 0.3)      # 方形區域的半邊長：包住環與外側的消逝場
+        field_dft = sim.add_dft_fields([mp.Ez], 1.0 / field_wvl_um, 0, 1,    # (分量, 最小頻率, 最大頻率, 頻率點數)：只記一個頻率
+                                       where=mp.Volume(center=mp.Vector3(0, 0),   # 環的圓心在原點
+                                                       size=mp.Vector3(2 * half, 2 * half)))
+
     # stop_when_fields_decayed(dt, 分量, 位置, 衰減比例)：每隔 dt = 50 個時間單位檢查一次，
     # 該位置的 Ez 振幅衰減到「峰值的 DECAY 倍」以下就停止（光源關掉之後才開始計）。
     sim.run(*step_funcs, until_after_sources=mp.stop_when_fields_decayed(
@@ -416,6 +446,15 @@ def run_spectrum(p, with_ring, ring_medium=None, want_eps=False, want_harminv=Fa
 
     flux = np.array(mp.get_fluxes(through))
     freqs = np.array(mp.get_flux_freqs(through))
+
+    # 取出 DFT 場（使用 MPI 時這兩個呼叫是「集體操作」，每個 rank 都要呼叫，且每個 rank 都會拿到完整陣列）
+    if field_dft is not None:
+        # get_array_metadata 回傳這塊 DFT 區域的格點座標 x、y（一維）與積分權重 w（二維，∑ f·w ≈ ∬ f dA，邊界格點權重較小）
+        xs, ys, _zs, ws = sim.get_array_metadata(dft=field_dft)
+        # get_dft_array(DFT 物件, 分量, 第幾個頻率)：回傳該頻率的複數場，形狀 (len(xs), len(ys))；
+        # Meep 已把 Yee 格上錯開半格的場內插到格點中心，所以座標與 Ez 的陣列互相對齊
+        ez = sim.get_dft_array(field_dft, mp.Ez, 0)
+        fields_out.update(x=np.asarray(xs), y=np.asarray(ys), w=np.asarray(ws), Ez=np.asarray(ez))
 
     # 取出介電常數分布，用來畫 2D 結構圖
     eps = None
@@ -585,6 +624,94 @@ def phase_efficiency(shift_um, lam0_um, p):
     eta = dphi / v if v > 0 else np.nan                         # 效率 (rad/V)；0 V 沒有意義
     vpil = v * (circ_um * 1e-4) * np.pi / abs(dphi) if (v > 0 and dphi != 0) else np.nan   # 1 µm = 1e-4 cm
     return dphi, eta, vpil
+
+
+# ============================================================
+# 4a. 有效折射率與有效損耗：用共振場 |E|² 對載子造成的 Δn_c、Δα_c 做加權平均
+# ============================================================
+# 公式（波導截面 S 上，E 為模態電場）：
+#     Δn_eff = ∬_S Δn_c(x,y)·|E(x,y)|² dxdy / ∬_S |E(x,y)|² dxdy
+#     Δα_eff = ∬_S Δα_c(x,y)·|E(x,y)|² dxdy / ∬_S |E(x,y)|² dxdy
+# 意思：載子造成的折射率（損耗）變化，只有「光場所在的位置」才有貢獻，所以用光強當權重取平均。
+#
+# 2D 模型怎麼對應這個公式（重點）：
+#   - 公式裡的 S 是「垂直於傳播方向」的截面。我們的 Meep 是 2D，模擬平面 (x,y) 就是環的「俯視圖」，
+#     光沿著環的角度方向 φ 傳播，垂直於傳播方向的截面只剩「徑向 r」這一條線（垂直方向 z 被等效折射率 N_SI 吸收掉了）。
+#   - 環上摻雜沿 φ 均勻，共振場 |E|² 沿 φ 也近似均勻（駐波的節點會讓 |E|² 隨 φ 起伏，
+#     但 Δn_c 只依賴 r，分子分母的 φ 起伏相消），所以做法是：
+#     對「環的環形區域」的每個格點取 |Ez|²，用 Meep 給的面積權重 w 積分（∬ dA = r dr dφ），
+#     得到的結果等於「以 r 為權重的徑向加權平均」。
+#   - 2D 的「電場」只有 Ez 一個分量（光源是 Ez，TM 偏振），所以 |E|² = |Ez|²。
+#   - 限制：Δn_c 是體材矽的值，沒有 3D 的垂直重疊；所以 Δn_eff 是「2D 等效折射率變化」，
+#     若要換成真實波導的 Δn_eff，還要再乘垂直方向光場落在矽裡的比例（本程式沒有做）。
+
+def effective_from_field(p, x, y, w, ez, lam0_um, phys, bus_y):
+    """
+    純 numpy 的核心計算（不需要 Meep，方便用合成的場測試）。
+    p       : 參數 dict（要有 R、W、X_JUNC、N_SI、N_CLAD、EFF_MARGIN、N_G）
+    x, y    : 格點座標（一維陣列，µm）
+    w       : 積分權重（二維，形狀 (len(x), len(y))，∑ f·w ≈ ∬ f dA）
+    ez      : 共振頻率的複數 Ez（二維，形狀同 w）
+    lam0_um : 共振波長 (µm)，只用來換算位移
+    phys    : pn_carrier_physics(p) 的結果（取空乏深度與完整空乏層的 Δn、Δα）
+    bus_y   : 直波導中心的 y 座標（用來把直波導的格點剔除）
+    回傳 dict：dn_eff、dalpha_eff_cm、gamma_p、gamma_n、shift_pert_nm、shift_pert_eps_nm、E2_in_ring。
+    """
+    X, Y = np.meshgrid(x, y, indexing="ij")            # 二維座標網格，索引順序與 ez、w 相同
+    r = np.hypot(X, Y)                                 # 每個格點到環心的距離（徑向座標）
+    e2 = np.abs(ez) ** 2                               # |E|² = |Ez|²（2D、Ez 偏振）
+
+    # --- 積分範圍：環形區域，剔除直波導的格點 ---
+    half_w, margin = p["W"] / 2, p.get("EFF_MARGIN", 0.3)
+    in_annulus = np.abs(r - p["R"]) <= half_w + margin  # 環的內外緣各外擴 margin
+    in_bus = np.abs(Y - bus_y) <= half_w                # 直波導內的格點不屬於環
+    weight = w * in_annulus * (~in_bus)                 # 積分權重（範圍外為 0）
+    denom = np.sum(e2 * weight)                         # 分母 ∬|E|² dA
+    if not np.isfinite(denom) or denom <= 0:
+        raise ValueError("場加權積分的分母為 0（區域內沒有場）")
+
+    # --- Δn_c(r)、Δα_c(r)：新增空乏層（相對 0 V）的分布 ---
+    # 接面在 rj = R + X_JUNC；p 在內側、n 在外側。偏壓 V 使空乏區從 0 V 的深度擴到 V 的深度，
+    # 「新增的那一層」載子被掃光（ΔN = −Na 或 −Nd），其餘位置 Δn_c = Δα_c = 0。
+    rj = p["R"] + p.get("X_JUNC", 0.0)
+    p_layer = (r >= rj - phys["xp_on_um"]) & (r < rj - phys["xp_off_um"])    # p 側新增層
+    n_layer = (r > rj + phys["xn_off_um"]) & (r <= rj + phys["xn_on_um"])    # n 側新增層
+    in_si = np.abs(r - p["R"]) <= half_w                # 只有矽裡才有載子（空乏層超出環寬的部分沒有材料）
+    p_layer, n_layer = p_layer & in_si, n_layer & in_si
+    dn_c = np.where(p_layer, phys["dn_h_full"], 0.0) + np.where(n_layer, phys["dn_e_full"], 0.0)
+    da_c = np.where(p_layer, phys["dalpha_h_full_cm"], 0.0) + np.where(n_layer, phys["dalpha_e_full_cm"], 0.0)
+
+    # --- 兩條公式 ---
+    dn_eff = np.sum(dn_c * e2 * weight) / denom         # Δn_eff（無因次）
+    da_eff = np.sum(da_c * e2 * weight) / denom         # Δα_eff（cm^-1）
+
+    # --- 換算成共振位移，與 Meep 直接量到的 shift_nm 對照 ---
+    # (a) 用你的公式：Δλ ≈ λ·Δn_eff / n_g（n_g = 群折射率 N_G）
+    shift_a = lam0_um * dn_eff / p["N_G"] * 1e3         # nm
+    # (b) 嚴格的一階微擾：Δλ/λ = ∬ n·Δn·|E|² / ∬ n²·|E|²（用實際的 n(r)，不需要 n_g）
+    n_loc = np.where(in_si, p["N_SI"], p["N_CLAD"])     # 每個格點的折射率（環內矽、環外包覆層）
+    shift_b = lam0_um * np.sum(n_loc * dn_c * e2 * weight) / np.sum(n_loc ** 2 * e2 * weight) * 1e3  # nm
+    return dict(dn_eff=float(dn_eff), dalpha_eff_cm=float(da_eff),
+                gamma_p=float(np.sum(p_layer * e2 * weight) / denom),    # 光場落在 p 側新增層的比例
+                gamma_n=float(np.sum(n_layer * e2 * weight) / denom),    # 光場落在 n 側新增層的比例
+                shift_pert_nm=float(shift_a), shift_pert_eps_nm=float(shift_b))
+
+
+def effective_index_loss(p, lam0_um):
+    """
+    跑一次 OFF 狀態的模擬，在共振波長 lam0_um 取出 Ez 頻域場，再呼叫 effective_from_field。
+    p 必須是 resolve_pn_params 之後的參數（要有 V_REV、NA、ND 等）。回傳 dict（失敗時由呼叫者處理）。
+    """
+    if not p.get("PN_FROM_PHYSICS", False):
+        raise ValueError("場加權公式需要 PN_FROM_PHYSICS=True（要有空乏層的位置與完整層內的 Δn、Δα）")
+    phys = pn_carrier_physics(p)
+    ring_medium = si_medium(p["N_SI"], 0.0, p["ALPHA_DOPE"])        # OFF 的環材料（與 _simulate_once 相同）
+    fields = {}
+    run_spectrum(p, True, ring_medium, depl_width=p["W_DEPL_OFF"],  # OFF 的幾何
+                 field_wvl_um=lam0_um, fields_out=fields)
+    bus_y, _, _ = cell_geometry(p)
+    return effective_from_field(p, fields["x"], fields["y"], fields["w"], fields["Ez"],
+                                lam0_um, phys, bus_y)
 
 
 # ============================================================
@@ -1002,6 +1129,14 @@ def evaluate(p, make_plots=False, ref_cache=None, center_um=None, max_retry=2, s
         shift_nm=shift_um * 1e3,                           # 中間量：相位效率由它算出
         ER_dB=mod["ER_mod"],                               # 指標一：調變消光比（雷射放在 OFF/ON 差最大的波長）
         phase_eff_rad_per_V=eta, VpiL_Vcm=vpil)            # 指標二：相位調變效率
+
+    # 選擇性：場加權的有效折射率／損耗（要多跑一次 OFF 模擬）。所有 rank 都要呼叫（取場是集體操作）。
+    if p.get("COMPUTE_EFFECTIVE") and valid:
+        try:
+            eff = effective_index_loss(p, lam0_ref)
+            metrics.update(eff)                              # 額外鍵：dn_eff、dalpha_eff_cm、gamma_p、gamma_n、shift_pert_*
+        except Exception as e:                               # noqa: BLE001（失敗不影響主要指標）
+            metrics["effective_error"] = str(e)
 
     # 只讓主程序存檔（用 MPI 平行時避免每個 rank 都寫檔）
     if make_plots and mp.am_master():
